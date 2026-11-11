@@ -1,0 +1,18 @@
+/target/
+.forgeguard/reports/
+.DS_Store
+*.swp
+*.tmp
+.env
+.env.*
+!.env.example
+.claude
+.agents
+.codex
+.cursor/
+/.forgeguard/
+/npm/vendor/
+/npm/*.tgz
+# Throwaway repositories for trying `forgeguard init` by hand. Built by
+# `sh tests/sandbox.sh`; safe to delete at any time.
+/sandbox/

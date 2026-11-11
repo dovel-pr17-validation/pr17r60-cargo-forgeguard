@@ -1,0 +1,28 @@
+[package]
+name = "forgeguard"
+version = "0.21.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Token-efficient, language-agnostic engineering guardrails for AI coding agents"
+readme = "../../README.md"
+keywords = ["ai", "coding-agent", "quality", "static-analysis", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+rust-version.workspace = true
+
+[[bin]]
+name = "forgeguard"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+inquire.workspace = true
+kurir.workspace = true
+rmcp.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+forgeguard-core = { version = "0.10.0", path = "../forgeguard-core" }

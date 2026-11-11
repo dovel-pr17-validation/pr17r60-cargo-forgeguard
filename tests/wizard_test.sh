@@ -1,0 +1,350 @@
+#!/bin/sh
+# Drive the interactive `forgeguard init` wizard through a pseudo-terminal.
+#
+# The wizard only runs when stdout is a TTY, so a plain pipe cannot reach it.
+# `script` allocates a PTY, and keystrokes are paced with sleeps because the
+# prompts read raw key events as they render rather than buffering a script.
+set -eu
+
+# This test asserts the coloured logo; do not inherit an operator's request for
+# plain terminal output into the pseudo-terminal fixture.
+unset NO_COLOR
+
+repository_root="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+# Prefer a debug build, which is what a developer has to hand, but fall back to
+# the release one: CI only ever runs `cargo build --release`, and `cargo test`
+# does not leave a plain binary behind.
+binary="${FORGEGUARD_BINARY:-}"
+if [ -z "$binary" ]; then
+    for candidate in debug release; do
+        if [ -x "${repository_root}/target/${candidate}/forgeguard" ]; then
+            binary="${repository_root}/target/${candidate}/forgeguard"
+            break
+        fi
+    done
+fi
+temporary_directory="$(mktemp -d)"
+trap 'rm -rf "$temporary_directory"' EXIT HUP INT TERM
+
+if ! command -v script >/dev/null 2>&1; then
+    echo "skip: script(1) is unavailable, cannot allocate a PTY" >&2
+    exit 0
+fi
+test -n "$binary" && test -x "$binary" || {
+    echo "error: no forgeguard binary under ${repository_root}/target; run 'cargo build' first" >&2
+    exit 1
+}
+
+# `script` differs between BSD and GNU: BSD takes the command as trailing
+# arguments, util-linux needs -c with the command as one string.
+#
+# Detection reads --help rather than probing with a real run: a probe that
+# guesses wrong lands in an interactive shell and hangs CI instead of failing.
+# BSD script rejects long options, so its usage text never mentions --command.
+if script --help 2>&1 | grep -q -- '--command'; then
+    script_flavour="util-linux"
+else
+    script_flavour="bsd"
+fi
+
+# Belt and braces: if the flavour is ever misdetected, fail after a minute
+# rather than hanging the job. `timeout` is absent on a stock macOS.
+if command -v timeout >/dev/null 2>&1; then
+    bounded() { timeout 60 "$@"; }
+else
+    bounded() { "$@"; }
+fi
+
+run_on_pty() {
+    if [ "$script_flavour" = "util-linux" ]; then
+        command_string="$1"
+        shift
+        for argument in "$@"; do
+            command_string="$command_string '$argument'"
+        done
+        bounded script -q -e -c "$command_string" /dev/null
+    else
+        bounded script -q /dev/null "$@"
+    fi
+}
+strip_ansi() {
+    sed 's/\x1b\[[0-9;?]*[a-zA-Z]//g'
+}
+
+project="${temporary_directory}/project"
+mkdir -p "$project/.claude" "$project/.cursor"
+git -C "$project" init -q
+
+# Enter x6: accept "This repository", accept the pre-selected agents, accept the
+# gitignore prompt, accept the memory index prompt, accept the MCP prompt,
+# accept the mode prompt.
+printf '/node_modules/\n' > "$project/.gitignore"
+transcript="${temporary_directory}/transcript"
+{
+    sleep 0.6; printf '\r'
+    sleep 0.6; printf '\r'
+    sleep 0.6; printf '\r'
+    sleep 0.6; printf '\r'
+    sleep 0.6; printf '\r'
+    sleep 0.6; printf '\r'
+    # Closing stdin ends the PTY session and kills the child, so hold it open
+    # long enough for the registration and the index to finish printing.
+    sleep 3
+} | run_on_pty "$binary" --root "$project" init > "$transcript" 2>&1 || true
+strip_ansi < "$transcript" > "${transcript}.plain"
+
+assert_contains() {
+    if ! grep -qF -e "$2" "${transcript}.plain"; then
+        echo "error: expected to find: $2" >&2
+        cat "${transcript}.plain" >&2
+        exit 1
+    fi
+}
+
+# The wizard ran at all, and the banner drew the brand mark: half-blocks in the
+# shield colour, not just the wordmark next to them.
+assert_contains "wordmark" "ForgeGuard"
+for expected in '▀' '38;5;114'; do
+    if ! grep -qF "$expected" "$transcript"; then
+        echo "error: banner did not render the logo mark: $expected" >&2
+        exit 1
+    fi
+done
+# Detection reported both agents before the picker.
+assert_contains "detection step" "claude, cursor"
+# Rows carry what each target installs, not just a bare name.
+assert_contains "menu summary" "CLAUDE.md, own skill, Stop hook"
+assert_contains "AGENTS.md-only row" "AGENTS.md only"
+# Controls distinguish movement from selection and explain the explicit CLI path.
+assert_contains "picker navigation and selection help" "move the highlight; Space toggles a checkbox; Enter confirms checked agents"
+assert_contains "picker selection status" "checked agents will be installed"
+assert_contains "explicit agent option" "forgeguard init --agent <name>"
+assert_contains "OpenCode example" "--agent opencode"
+
+# Detected agents arrive pre-checked, everything else unchecked.
+assert_contains "claude preselected" "◼ claude"
+assert_contains "cursor preselected" "◼ cursor"
+assert_contains "codex not preselected" "◻ codex"
+# The write summary is grouped rather than one line per file.
+assert_contains "result panel" "installed"
+assert_contains "agents line" "agents   claude, cursor"
+# Asserted as a prefix: the point is that the tree collapsed to one line, not
+# how many skill assets ForgeGuard happens to ship this release.
+assert_contains "grouped writes" ".claude/ ("
+
+# Accepting the pre-selection must install exactly those two agents.
+test -f "$project/CLAUDE.md" || { echo "error: CLAUDE.md missing" >&2; exit 1; }
+test -f "$project/.cursor/rules/forgeguard.mdc" || { echo "error: cursor rules missing" >&2; exit 1; }
+test ! -f "$project/AGENTS.md" || { echo "error: AGENTS.md written for an unselected agent" >&2; exit 1; }
+
+# Accepting the index prompt must leave a code graph behind, so the first agent
+# session can query symbols instead of reading files.
+assert_contains "index prompt" "Build the code memory index now?"
+assert_contains "index summary" "indexed"
+test -f "$project/.forgeguard/cache/memory/graph.db" || {
+    echo "error: memory index was accepted but no graph.db was written" >&2
+    cat "${transcript}.plain" >&2
+    exit 1
+}
+
+# The MCP server is registered per repository, once per selected agent, and the
+# generated config files are ignored rather than committed.
+assert_contains "mcp prompt" "Register the ForgeGuard MCP server here?"
+for config in ".mcp.json" ".cursor/mcp.json"; do
+    test -f "$project/$config" || {
+        echo "error: MCP config missing: $config" >&2
+        cat "${transcript}.plain" >&2
+        exit 1
+    }
+    if ! grep -qF "forgeguard" "$project/$config"; then
+        echo "error: $config has no forgeguard server entry" >&2
+        exit 1
+    fi
+    if ! grep -qF "$config" "$project/.gitignore"; then
+        echo "error: $config was not added to .gitignore" >&2
+        cat "$project/.gitignore" >&2
+        exit 1
+    fi
+done
+# An unselected agent must not be registered.
+test ! -f "$project/.agents/mcp_config.json" || {
+    echo "error: MCP registered for an unselected agent" >&2
+    exit 1
+}
+
+# A drifted ForgeGuard-owned file must be offered, not silently replaced. An
+# edited CLAUDE.md is the user's file: it is reported as kept, never offered.
+drift="${temporary_directory}/drift"
+mkdir -p "$drift/.claude"
+git -C "$drift" init -q
+"$binary" --root "$drift" init --agent claude >/dev/null 2>&1
+printf 'hand written\n' > "$drift/CLAUDE.md"
+printf 'from an older release\n' > "$drift/.claude/skills/forgeguard-engineering/SKILL.md"
+{
+    sleep 0.6; printf '\r'
+    sleep 0.6; printf '\r'
+    sleep 1.0
+} | run_on_pty "$binary" --root "$drift" init --agent claude > "${temporary_directory}/drift-out" 2>&1 || true
+strip_ansi < "${temporary_directory}/drift-out" > "${temporary_directory}/drift-plain"
+
+for expected in "ForgeGuard file" "SKILL.md" "Replace them with the bundled versions?" "left as-is" "CLAUDE.md"; do
+    if ! grep -qF "$expected" "${temporary_directory}/drift-plain"; then
+        echo "error: refresh prompt never showed: $expected" >&2
+        cat "${temporary_directory}/drift-plain" >&2
+        exit 1
+    fi
+done
+# Enter accepts the default, which is to keep the file.
+if [ "$(cat "$drift/CLAUDE.md")" != "hand written" ]; then
+    echo "error: declining the prompt still replaced the file" >&2
+    exit 1
+fi
+# CLAUDE.md belongs to the user, so it is never one of the files the prompt
+# offers to replace.
+if grep -A4 -F "differ from this version" "${temporary_directory}/drift-plain" | grep -qF "CLAUDE.md"; then
+    echo "error: refresh prompt offered to replace the user's CLAUDE.md" >&2
+    cat "${temporary_directory}/drift-plain" >&2
+    exit 1
+fi
+
+# Global installation has no Code Guard mode to select and must not rewrite a
+# legacy global config left by an older release.
+global_home="${temporary_directory}/global-home"
+mkdir -p "$global_home/.forgeguard"
+printf 'version = 1\nmode = "strict"\n\n[project]\nname = "legacy-global"\n' > "$global_home/.forgeguard/config.toml"
+cp "$global_home/.forgeguard/config.toml" "${temporary_directory}/legacy-global-config"
+run_on_pty env "HOME=$global_home" "$binary" init --global --refresh --agent codex > "${temporary_directory}/global-out" 2>&1
+strip_ansi < "${temporary_directory}/global-out" > "${temporary_directory}/global-plain"
+if grep -qF "Code Guard mode" "${temporary_directory}/global-plain"; then
+    echo "error: global init opened the repository mode picker" >&2
+    cat "${temporary_directory}/global-plain" >&2
+    exit 1
+fi
+if ! cmp -s "${temporary_directory}/legacy-global-config" "$global_home/.forgeguard/config.toml"; then
+    echo "error: global init rewrote the legacy global config" >&2
+    exit 1
+fi
+
+# An empty pick must install nothing. Left arrow clears the selection, and two
+# empty confirmations cancel.
+empty="${temporary_directory}/empty"
+mkdir -p "$empty/.claude"
+git -C "$empty" init -q
+{
+    sleep 0.6; printf '\r'
+    sleep 0.6; printf '\033[D'
+    sleep 0.3; printf '\r'
+    sleep 0.6; printf '\033[D'
+    sleep 0.3; printf '\r'
+    sleep 1.0
+} | run_on_pty "$binary" --root "$empty" init > "${temporary_directory}/empty-out" 2>&1 || true
+
+strip_ansi < "${temporary_directory}/empty-out" > "${temporary_directory}/empty-plain"
+if [ -f "$empty/CLAUDE.md" ]; then
+    echo "error: an empty selection installed files" >&2
+    cat "${temporary_directory}/empty-plain" >&2
+    exit 1
+fi
+# Guard against passing for the wrong reason: the run must have reached the
+# picker, been re-asked, and then cancelled.
+for expected in "nothing selected" "pick at least one" "no agent selected"; do
+    if ! grep -qF "$expected" "${temporary_directory}/empty-plain"; then
+        echo "error: empty-pick run never reached: $expected" >&2
+        cat "${temporary_directory}/empty-plain" >&2
+        exit 1
+    fi
+done
+# With no detected configuration, moving to OpenCode and pressing Space must
+# select it; Enter then installs only that checked agent.
+space_selected="${temporary_directory}/space-selected"
+mkdir -p "$space_selected"
+git -C "$space_selected" init -q
+{
+    sleep 0.6; printf '\r'
+    sleep 0.6; printf '\033[B'
+    sleep 0.2; printf '\033[B'
+    sleep 0.2; printf '\033[B'
+    sleep 0.2; printf ' '
+    sleep 0.3; printf '\r'
+    sleep 0.6; printf '\r'
+    sleep 0.6; printf '\r'
+    sleep 0.6; printf '\r'
+    sleep 0.6; printf '\r'
+    sleep 2
+} | run_on_pty "$binary" --root "$space_selected" init > "${temporary_directory}/space-out" 2>&1 || true
+strip_ansi < "${temporary_directory}/space-out" > "${temporary_directory}/space-plain"
+if ! grep -qF "no agent configuration found; nothing is pre-selected" "${temporary_directory}/space-plain"; then
+    echo "error: empty-detection picker never showed its selection state" >&2
+    cat "${temporary_directory}/space-plain" >&2
+    exit 1
+fi
+if grep -qF "nothing selected" "${temporary_directory}/space-plain"; then
+    echo "error: pressing Space did not select OpenCode" >&2
+    cat "${temporary_directory}/space-plain" >&2
+    exit 1
+fi
+test -f "$space_selected/AGENTS.md" || {
+    echo "error: Space did not select OpenCode for installation" >&2
+    cat "${temporary_directory}/space-plain" >&2
+    exit 1
+}
+test ! -f "$space_selected/CLAUDE.md" || {
+    echo "error: Space-selected OpenCode run installed another agent" >&2
+    exit 1
+}
+
+# An explicit OpenCode target bypasses the interactive picker.
+explicit_opencode="${temporary_directory}/explicit-opencode"
+mkdir -p "$explicit_opencode"
+git -C "$explicit_opencode" init -q
+"$binary" --root "$explicit_opencode" init --agent opencode > /dev/null 2>&1
+test -f "$explicit_opencode/AGENTS.md" || {
+    echo "error: --agent opencode did not install OpenCode configuration" >&2
+    exit 1
+}
+
+# The flags answer the same questions without a terminal, and a run without them
+# keeps the old behaviour: install only.
+scripted="${temporary_directory}/scripted"
+mkdir -p "$scripted"
+git -C "$scripted" init -q
+printf 'pub fn scripted_marker() {}\n' > "$scripted/lib.rs"
+"$binary" --root "$scripted" init --agent claude --index --mcp > /dev/null 2>&1
+test -f "$scripted/.mcp.json" || { echo "error: --mcp did not register" >&2; exit 1; }
+test -f "$scripted/.forgeguard/cache/memory/graph.db" || {
+    echo "error: --index did not build the graph" >&2
+    exit 1
+}
+
+# `--agent all` has to reach every harness: the requested list is a single `all`
+# target, so registration reads the expanded list the installer reports.
+everything="${temporary_directory}/everything"
+mkdir -p "$everything"
+git -C "$everything" init -q
+"$binary" --root "$everything" init --agent all --mcp > /dev/null 2>&1
+for config in ".mcp.json" ".cursor/mcp.json" "opencode.json"; do
+    test -f "$everything/$config" || {
+        echo "error: --agent all did not register $config" >&2
+        exit 1
+    }
+done
+
+bare="${temporary_directory}/bare"
+mkdir -p "$bare"
+git -C "$bare" init -q
+"$binary" --root "$bare" init --agent claude > /dev/null 2>&1
+test ! -f "$bare/.mcp.json" || { echo "error: MCP registered without --mcp" >&2; exit 1; }
+test ! -f "$bare/.forgeguard/cache/memory/graph.db" || {
+    echo "error: index built without --index" >&2
+    exit 1
+}
+
+# A memory query refreshes the graph itself, so an edit made after the index is
+# visible without a manual re-index.
+printf 'pub fn added_after_index() {}\n' > "$scripted/added.rs"
+if ! "$binary" --root "$scripted" memory find added_after_index | grep -qF "added_after_index"; then
+    echo "error: memory find did not pick up a file added after the index" >&2
+    exit 1
+fi
+
+echo "wizard test passed"

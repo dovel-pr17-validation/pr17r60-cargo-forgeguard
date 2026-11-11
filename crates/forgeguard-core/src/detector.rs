@@ -1,0 +1,639 @@
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    path::{Path, PathBuf},
+};
+
+use anyhow::{Context, Result};
+use ignore::WalkBuilder;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use crate::config::CommandConfig;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectDetection {
+    pub root: PathBuf,
+    pub languages: Vec<String>,
+    pub frameworks: Vec<String>,
+    pub package_managers: Vec<String>,
+    pub database_tools: Vec<String>,
+    pub test_tools: Vec<String>,
+    pub suggested_commands: Vec<CommandConfig>,
+}
+
+pub fn detect_project(root: &Path) -> Result<ProjectDetection> {
+    let root = root
+        .canonicalize()
+        .with_context(|| format!("failed to resolve project root {}", root.display()))?;
+
+    let mut languages = BTreeSet::new();
+    let mut frameworks = BTreeSet::new();
+    let mut package_managers = BTreeSet::new();
+    let mut database_tools = BTreeSet::new();
+    let mut test_tools = BTreeSet::new();
+    let mut commands = BTreeMap::<String, CommandConfig>::new();
+
+    detect_source_languages(&root, &mut languages);
+
+    if root.join("Cargo.toml").exists() {
+        languages.insert("Rust".to_owned());
+        package_managers.insert("Cargo".to_owned());
+        test_tools.insert("cargo test".to_owned());
+        add_command(&mut commands, "format", "cargo fmt --all -- --check", true);
+        add_command(
+            &mut commands,
+            "lint",
+            "cargo clippy --workspace --all-targets --all-features -- -D warnings",
+            true,
+        );
+        add_command(&mut commands, "test", "cargo test --workspace", true);
+        add_command(&mut commands, "build", "cargo build --workspace", true);
+        add_optional_command(
+            &mut commands,
+            "dependency-audit",
+            "cargo audit --deny warnings",
+        );
+        add_optional_command(&mut commands, "supply-chain", "cargo deny check");
+        add_optional_command(
+            &mut commands,
+            "sbom",
+            "cargo cyclonedx --format json --override-filename forgeguard-sbom",
+        );
+    }
+
+    if root.join("go.mod").exists() {
+        languages.insert("Go".to_owned());
+        package_managers.insert("Go modules".to_owned());
+        test_tools.insert("go test".to_owned());
+        add_command(
+            &mut commands,
+            "format",
+            "gofmt -l . | awk 'NF { found=1 } END { exit found }'",
+            true,
+        );
+        add_command(&mut commands, "test", "go test ./...", true);
+        add_command(&mut commands, "lint", "go vet ./...", true);
+        add_command(&mut commands, "build", "go build ./...", true);
+        add_optional_command(&mut commands, "dependency-audit", "govulncheck ./...");
+    }
+
+    if root.join("pyproject.toml").exists()
+        || root.join("requirements.txt").exists()
+        || root.join("setup.py").exists()
+    {
+        languages.insert("Python".to_owned());
+        detect_python(&root, &mut package_managers, &mut test_tools, &mut commands)?;
+        add_optional_command(&mut commands, "dependency-audit", "pip-audit");
+        add_optional_command(&mut commands, "license", "pip-licenses --format=json");
+        add_optional_command(
+            &mut commands,
+            "sbom",
+            "cyclonedx-py environment --output-format JSON",
+        );
+    }
+
+    let package_json = root.join("package.json");
+    if package_json.exists() {
+        languages.insert("JavaScript/TypeScript".to_owned());
+        detect_node(
+            &package_json,
+            &root,
+            &mut frameworks,
+            &mut package_managers,
+            &mut database_tools,
+            &mut test_tools,
+            &mut commands,
+        )?;
+    }
+
+    if root.join("pom.xml").exists()
+        || root.join("build.gradle").exists()
+        || root.join("build.gradle.kts").exists()
+    {
+        detect_java_kotlin(
+            &root,
+            &mut languages,
+            &mut package_managers,
+            &mut test_tools,
+            &mut commands,
+        );
+    }
+
+    if root.join("Package.swift").exists() {
+        languages.insert("Swift".to_owned());
+        package_managers.insert("Swift Package Manager".to_owned());
+        test_tools.insert("swift test".to_owned());
+        add_command(&mut commands, "test", "swift test", true);
+        add_command(&mut commands, "build", "swift build", true);
+    }
+
+    let pubspec = root.join("pubspec.yaml");
+    if pubspec.exists() {
+        detect_dart(
+            &pubspec,
+            &mut languages,
+            &mut frameworks,
+            &mut package_managers,
+            &mut test_tools,
+            &mut commands,
+        );
+    }
+
+    if has_root_extension(&root, &["sln", "csproj"]) {
+        languages.insert("C#".to_owned());
+        package_managers.insert("NuGet".to_owned());
+        test_tools.insert("dotnet test".to_owned());
+        add_command(
+            &mut commands,
+            "format",
+            "dotnet format --verify-no-changes",
+            true,
+        );
+        add_command(&mut commands, "test", "dotnet test", true);
+        add_command(&mut commands, "build", "dotnet build --no-restore", true);
+        add_optional_command(
+            &mut commands,
+            "dependency-audit",
+            "dotnet restore -p:NuGetAudit=true -p:NuGetAuditMode=all -p:WarningsAsErrors=\"NU1901;NU1902;NU1903;NU1904\"",
+        );
+    }
+
+    if root.join("composer.json").exists() {
+        languages.insert("PHP".to_owned());
+        package_managers.insert("Composer".to_owned());
+        add_optional_command(&mut commands, "dependency-audit", "composer audit");
+    }
+
+    let has_cmake = root.join("CMakeLists.txt").exists();
+    let has_makefile = ["Makefile", "makefile", "GNUmakefile"]
+        .iter()
+        .any(|name| root.join(name).exists());
+    if has_cmake || has_makefile {
+        detect_ccpp(
+            has_cmake,
+            &mut languages,
+            &mut package_managers,
+            &mut test_tools,
+            &mut commands,
+        );
+    }
+
+    if root.join("Gemfile").exists() {
+        languages.insert("Ruby".to_owned());
+        package_managers.insert("Bundler".to_owned());
+        add_optional_command(
+            &mut commands,
+            "dependency-audit",
+            "bundle audit check --update",
+        );
+    }
+
+    detect_database_tools(&root, &mut database_tools);
+
+    Ok(ProjectDetection {
+        root,
+        languages: languages.into_iter().collect(),
+        frameworks: frameworks.into_iter().collect(),
+        package_managers: package_managers.into_iter().collect(),
+        database_tools: database_tools.into_iter().collect(),
+        test_tools: test_tools.into_iter().collect(),
+        suggested_commands: commands.into_values().collect(),
+    })
+}
+
+fn detect_node(
+    package_json: &Path,
+    root: &Path,
+    frameworks: &mut BTreeSet<String>,
+    package_managers: &mut BTreeSet<String>,
+    database_tools: &mut BTreeSet<String>,
+    test_tools: &mut BTreeSet<String>,
+    commands: &mut BTreeMap<String, CommandConfig>,
+) -> Result<()> {
+    let source = fs::read_to_string(package_json)
+        .with_context(|| format!("failed to read {}", package_json.display()))?;
+    let value: Value = serde_json::from_str(&source)
+        .with_context(|| format!("failed to parse {}", package_json.display()))?;
+
+    let dependencies = dependency_names(&value);
+    for (package, label) in [
+        ("next", "Next.js"),
+        ("react", "React"),
+        ("vue", "Vue"),
+        ("svelte", "Svelte"),
+        ("@angular/core", "Angular"),
+        ("express", "Express"),
+        ("fastify", "Fastify"),
+        ("@nestjs/core", "NestJS"),
+        ("react-native", "React Native"),
+        ("expo", "Expo"),
+        ("@capacitor/core", "Capacitor"),
+        ("electron", "Electron"),
+        ("@langchain/core", "LangChain"),
+        ("@openai/agents", "OpenAI Agents SDK"),
+        ("ai", "Vercel AI SDK"),
+    ] {
+        if dependencies.contains(package) {
+            frameworks.insert(label.to_owned());
+        }
+    }
+
+    for (package, label) in [
+        ("prisma", "Prisma"),
+        ("@prisma/client", "Prisma"),
+        ("typeorm", "TypeORM"),
+        ("sequelize", "Sequelize"),
+        ("drizzle-orm", "Drizzle ORM"),
+        ("mongoose", "Mongoose"),
+    ] {
+        if dependencies.contains(package) {
+            database_tools.insert(label.to_owned());
+        }
+    }
+
+    for (package, label) in [
+        ("vitest", "Vitest"),
+        ("jest", "Jest"),
+        ("@playwright/test", "Playwright"),
+        ("cypress", "Cypress"),
+    ] {
+        if dependencies.contains(package) {
+            test_tools.insert(label.to_owned());
+        }
+    }
+
+    let (runner, package_manager) = if root.join("pnpm-lock.yaml").exists() {
+        package_managers.insert("pnpm".to_owned());
+        ("pnpm", "pnpm")
+    } else if root.join("yarn.lock").exists() {
+        package_managers.insert("Yarn".to_owned());
+        ("yarn", "yarn")
+    } else if root.join("bun.lockb").exists() || root.join("bun.lock").exists() {
+        package_managers.insert("Bun".to_owned());
+        ("bun run", "bun")
+    } else {
+        package_managers.insert("npm".to_owned());
+        ("npm run", "npm")
+    };
+
+    let scripts = value.get("scripts").and_then(Value::as_object);
+    if let Some(scripts) = scripts {
+        let mut added = BTreeSet::new();
+        let candidates = [
+            ("format:check", "format"),
+            ("format", "format"),
+            ("lint", "lint"),
+            ("typecheck", "typecheck"),
+            ("type-check", "typecheck"),
+            ("test", "test"),
+            ("test:unit", "test"),
+            ("build", "build"),
+            ("audit", "dependency-audit"),
+            ("licenses", "license"),
+            ("license", "license"),
+            ("sbom", "sbom"),
+        ];
+        for (script, name) in candidates {
+            if scripts.contains_key(script) && added.insert(name) {
+                let command = format!("{runner} {script}");
+                add_command(commands, name, &command, true);
+            }
+        }
+    }
+    if !scripts.is_some_and(|scripts| scripts.contains_key("audit")) {
+        add_optional_command(
+            commands,
+            "dependency-audit",
+            &format!("{package_manager} audit"),
+        );
+    }
+    if package_manager == "npm" && !scripts.is_some_and(|scripts| scripts.contains_key("sbom")) {
+        add_optional_command(commands, "sbom", "npm sbom --sbom-format cyclonedx");
+    }
+
+    Ok(())
+}
+
+fn detect_source_languages(root: &Path, languages: &mut BTreeSet<String>) {
+    let walker = WalkBuilder::new(root)
+        .hidden(false)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .filter_entry(|entry| {
+            !matches!(
+                entry.file_name().to_str(),
+                Some(
+                    ".git"
+                        | "target"
+                        | "node_modules"
+                        | "vendor"
+                        | ".venv"
+                        | "venv"
+                        | "dist"
+                        | "build"
+                        | ".next"
+                )
+            )
+        })
+        .build();
+    for entry in walker.filter_map(|entry| entry.ok()).filter(|entry| {
+        entry
+            .file_type()
+            .is_some_and(|file_type| file_type.is_file())
+    }) {
+        let Some(extension) = entry.path().extension().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        let language = match extension.to_ascii_lowercase().as_str() {
+            "rs" => "Rust",
+            "go" => "Go",
+            "py" | "pyi" => "Python",
+            "js" | "jsx" | "mjs" | "cjs" | "ts" | "tsx" | "mts" | "cts" => "JavaScript/TypeScript",
+            "java" | "kt" | "kts" => "Java/Kotlin",
+            "swift" => "Swift",
+            "dart" => "Dart",
+            "cs" => "C#",
+            "c" | "h" | "cc" | "cpp" | "cxx" | "hpp" => "C/C++",
+            "php" => "PHP",
+            "rb" => "Ruby",
+            "sh" | "bash" | "zsh" | "fish" => "Shell",
+            "lua" => "Lua",
+            "ex" | "exs" => "Elixir",
+            "erl" | "hrl" => "Erlang",
+            "scala" | "sc" => "Scala",
+            "r" => "R",
+            "sql" => "SQL",
+            "tf" | "hcl" => "Terraform/HCL",
+            "sol" => "Solidity",
+            "zig" => "Zig",
+            "vue" => "Vue SFC",
+            "svelte" => "Svelte",
+            "proto" => "Protocol Buffers",
+            _ => continue,
+        };
+        languages.insert(language.to_owned());
+    }
+}
+
+fn has_root_extension(root: &Path, extensions: &[&str]) -> bool {
+    let Ok(entries) = fs::read_dir(root) else {
+        return false;
+    };
+    entries.filter_map(|entry| entry.ok()).any(|entry| {
+        entry
+            .path()
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|extension| {
+                extensions
+                    .iter()
+                    .any(|candidate| extension.eq_ignore_ascii_case(candidate))
+            })
+    })
+}
+
+fn detect_python(
+    root: &Path,
+    package_managers: &mut BTreeSet<String>,
+    test_tools: &mut BTreeSet<String>,
+    commands: &mut BTreeMap<String, CommandConfig>,
+) -> Result<()> {
+    let pyproject = root.join("pyproject.toml");
+    let source = if pyproject.exists() {
+        fs::read_to_string(&pyproject)
+            .with_context(|| format!("failed to read {}", pyproject.display()))?
+    } else {
+        String::new()
+    };
+
+    if root.join("poetry.lock").exists() {
+        package_managers.insert("Poetry".to_owned());
+    } else if root.join("uv.lock").exists() {
+        package_managers.insert("uv".to_owned());
+    } else {
+        package_managers.insert("pip".to_owned());
+    }
+
+    if source.contains("pytest") || root.join("pytest.ini").exists() {
+        test_tools.insert("pytest".to_owned());
+        add_command(commands, "test", "pytest", true);
+    }
+    if source.contains("ruff") {
+        add_command(commands, "lint", "ruff check .", true);
+        add_command(commands, "format", "ruff format --check .", true);
+    }
+    if source.contains("mypy") {
+        add_command(commands, "typecheck", "mypy .", true);
+    }
+    if source.contains("pyright") {
+        add_command(commands, "typecheck", "pyright", true);
+    }
+    if source.contains("pylint") && !source.contains("ruff") {
+        add_command(commands, "lint", "pylint .", true);
+    }
+
+    Ok(())
+}
+
+/// Add C/C++ build and test presets. CMake presets configure and build in one
+/// step so a fresh checkout works, then run CTest against the build directory.
+fn detect_ccpp(
+    uses_cmake: bool,
+    languages: &mut BTreeSet<String>,
+    package_managers: &mut BTreeSet<String>,
+    test_tools: &mut BTreeSet<String>,
+    commands: &mut BTreeMap<String, CommandConfig>,
+) {
+    languages.insert("C/C++".to_owned());
+    test_tools.insert("C/C++ test".to_owned());
+    if uses_cmake {
+        package_managers.insert("CMake".to_owned());
+        add_command(
+            commands,
+            "build",
+            "cmake -S . -B build && cmake --build build",
+            true,
+        );
+        add_command(
+            commands,
+            "test",
+            "cmake -S . -B build && ctest --test-dir build --output-on-failure",
+            true,
+        );
+    } else {
+        package_managers.insert("Make".to_owned());
+        add_command(commands, "build", "make", true);
+        add_command(commands, "test", "make test", true);
+    }
+}
+
+/// Add Maven or Gradle build/test/audit presets for a Java/Kotlin project.
+fn detect_java_kotlin(
+    root: &Path,
+    languages: &mut BTreeSet<String>,
+    package_managers: &mut BTreeSet<String>,
+    test_tools: &mut BTreeSet<String>,
+    commands: &mut BTreeMap<String, CommandConfig>,
+) {
+    languages.insert("Java/Kotlin".to_owned());
+    test_tools.insert("Maven test".to_owned());
+    if root.join("pom.xml").exists() {
+        package_managers.insert("Maven".to_owned());
+        add_command(commands, "test", "mvn test", true);
+        add_command(commands, "build", "mvn package -DskipTests", true);
+        add_optional_command(
+            commands,
+            "dependency-audit",
+            "mvn org.owasp:dependency-check-maven:check -DfailBuildOnCVSS=0",
+        );
+        add_optional_command(
+            commands,
+            "sbom",
+            "mvn org.cyclonedx:cyclonedx-maven-plugin:makeAggregateBom",
+        );
+        return;
+    }
+    package_managers.insert("Gradle".to_owned());
+    let gradle = if root.join("gradlew").exists() {
+        "./gradlew"
+    } else {
+        "gradle"
+    };
+    add_command(commands, "test", &format!("{gradle} test"), true);
+    add_command(commands, "build", &format!("{gradle} build -x test"), true);
+    // forgeguard: allow FG-SEC-007 -- read-only scan of project-root config files
+    let build_source = fs::read_to_string(root.join("build.gradle"))
+        .or_else(|_| fs::read_to_string(root.join("build.gradle.kts")))
+        .unwrap_or_default();
+    if build_source.contains("dependency-check") {
+        add_optional_command(
+            commands,
+            "dependency-audit",
+            &format!("{gradle} dependencyCheckAnalyze"),
+        );
+    }
+    if build_source.to_ascii_lowercase().contains("cyclonedx") {
+        add_optional_command(commands, "sbom", &format!("{gradle} cyclonedxBom"));
+    }
+}
+
+/// Add Dart/Flutter format, lint, and test presets from a pubspec.
+fn detect_dart(
+    pubspec: &Path,
+    languages: &mut BTreeSet<String>,
+    frameworks: &mut BTreeSet<String>,
+    package_managers: &mut BTreeSet<String>,
+    test_tools: &mut BTreeSet<String>,
+    commands: &mut BTreeMap<String, CommandConfig>,
+) {
+    languages.insert("Dart".to_owned());
+    package_managers.insert("pub".to_owned());
+    // forgeguard: allow FG-SEC-007 -- read-only scan of project-root pubspec
+    let source = fs::read_to_string(pubspec).unwrap_or_default();
+    let flutter = source.lines().any(|line| line.trim() == "flutter:");
+    if flutter {
+        frameworks.insert("Flutter".to_owned());
+        test_tools.insert("flutter test".to_owned());
+    } else {
+        test_tools.insert("dart test".to_owned());
+    }
+    add_command(
+        commands,
+        "format",
+        "dart format --output=none --set-exit-if-changed .",
+        true,
+    );
+    add_command(commands, "lint", "dart analyze", true);
+    add_command(
+        commands,
+        "test",
+        if flutter { "flutter test" } else { "dart test" },
+        true,
+    );
+}
+
+/// Label database tooling from Prisma schemas and migration directories.
+fn detect_database_tools(root: &Path, database_tools: &mut BTreeSet<String>) {
+    if root.join("schema.prisma").exists() || root.join("prisma/schema.prisma").exists() {
+        database_tools.insert("Prisma".to_owned());
+    }
+    if root.join("migrations").exists() || root.join("db/migrations").exists() {
+        database_tools.insert("SQL migrations".to_owned());
+    }
+}
+
+fn dependency_names(value: &Value) -> BTreeSet<&str> {
+    ["dependencies", "devDependencies", "peerDependencies"]
+        .into_iter()
+        .filter_map(|key| value.get(key).and_then(Value::as_object))
+        .flat_map(|map| map.keys().map(String::as_str))
+        .collect()
+}
+
+fn add_command(
+    commands: &mut BTreeMap<String, CommandConfig>,
+    name: &str,
+    command: &str,
+    required: bool,
+) {
+    insert_command(
+        commands,
+        CommandConfig {
+            name: name.to_owned(),
+            command: command.to_owned(),
+            required,
+            enabled: true,
+            timeout_seconds: 600,
+        },
+    );
+}
+
+fn add_optional_command(commands: &mut BTreeMap<String, CommandConfig>, name: &str, command: &str) {
+    insert_command(
+        commands,
+        CommandConfig {
+            name: name.to_owned(),
+            command: command.to_owned(),
+            required: true,
+            enabled: false,
+            timeout_seconds: 600,
+        },
+    );
+}
+
+fn insert_command(commands: &mut BTreeMap<String, CommandConfig>, mut command: CommandConfig) {
+    if commands
+        .get(&command.name)
+        .is_some_and(|existing| existing.command == command.command)
+    {
+        return;
+    }
+    if commands.contains_key(&command.name) {
+        let tool = command
+            .command
+            .split_whitespace()
+            .next()
+            .unwrap_or("tool")
+            .trim_start_matches("./")
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() {
+                    character.to_ascii_lowercase()
+                } else {
+                    '-'
+                }
+            })
+            .collect::<String>();
+        let base = format!("{}-{tool}", command.name);
+        let mut candidate = base.clone();
+        let mut suffix = 2;
+        while commands.contains_key(&candidate) {
+            candidate = format!("{base}-{suffix}");
+            suffix += 1;
+        }
+        command.name = candidate;
+    }
+    commands.insert(command.name.clone(), command);
+}

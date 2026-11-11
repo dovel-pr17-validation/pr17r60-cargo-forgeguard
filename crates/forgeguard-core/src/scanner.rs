@@ -1,0 +1,2692 @@
+use std::{
+    collections::{BTreeSet, HashMap, HashSet},
+    fs,
+    path::Path,
+};
+
+use anyhow::{Context, Result};
+use ignore::WalkBuilder;
+use regex::Regex;
+use tree_sitter::{Language, Node, Parser};
+
+use crate::{
+    config::ScanConfig,
+    duplication::scan_duplicate_blocks,
+    git::ChangedScope,
+    model::{EvidenceConfidence, Finding, Severity},
+    rules,
+};
+
+#[derive(Debug, Clone, Default)]
+pub struct ScanOptions {
+    /// `None` scans the full project. `Some(vec![])` intentionally scans no files.
+    pub paths: Option<Vec<std::path::PathBuf>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExecutablePlaceholder {
+    pub kind: &'static str,
+    pub line: usize,
+    pub evidence: String,
+    pub fingerprint: String,
+}
+
+pub(crate) fn executable_placeholders(
+    path: &Path,
+    source: &str,
+) -> Result<Vec<ExecutablePlaceholder>> {
+    if is_test_path(path) {
+        return Ok(Vec::new());
+    }
+    let analyzer = Analyzer::new()?;
+    let component = analyzer.extract_component_script(path, source);
+    let (profile, source) = match component.as_ref() {
+        Some((profile, masked)) => (*profile, masked.as_str()),
+        None => match LanguageProfile::from_path(path) {
+            Some(profile) => (profile, source),
+            None => return Ok(Vec::new()),
+        },
+    };
+    let mut parser = Parser::new();
+    if parser.set_language(&profile.language()).is_err() {
+        return Ok(Vec::new());
+    }
+    let Some(tree) = parser
+        .parse(source, None)
+        .filter(|tree| !tree.root_node().has_error())
+    else {
+        return Ok(Vec::new());
+    };
+    let mut placeholders = Vec::new();
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        let fingerprint = compact_code(node_text(node, source));
+        if let Some(kind) = executable_placeholder_kind(node, source, &fingerprint) {
+            placeholders.push(ExecutablePlaceholder {
+                kind,
+                line: node.start_position().row + 1,
+                evidence: truncate(node_text(node, source), 240),
+                fingerprint,
+            });
+        }
+        stack.extend(
+            (0..node.named_child_count()).filter_map(|index| node.named_child(index as u32)),
+        );
+    }
+    Ok(placeholders)
+}
+
+fn compact_code(source: &str) -> String {
+    source
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn executable_placeholder_kind(
+    node: Node<'_>,
+    source: &str,
+    compact: &str,
+) -> Option<&'static str> {
+    let placeholder_message = compact.contains("notimplemented") || compact.contains("todo");
+    if node.kind() == "macro_invocation" {
+        if compact.starts_with("todo!(") {
+            return Some("todo!");
+        }
+        if compact.starts_with("unimplemented!(") {
+            return Some("unimplemented!");
+        }
+        if compact.starts_with("panic!(") && placeholder_message {
+            return Some("not implemented");
+        }
+    }
+    if let Some(callee) = call_name(node, source) {
+        return match terminal_name(callee).to_ascii_lowercase().as_str() {
+            "todo" => Some("TODO"),
+            "unimplemented" => Some("unimplemented"),
+            "notimplementederror" => Some("NotImplementedError"),
+            "notimplementedexception" => Some("NotImplementedException"),
+            "unimplementederror" => Some("UnimplementedError"),
+            "error" | "fatalerror" | "panic" if placeholder_message => Some("not implemented"),
+            _ => None,
+        };
+    }
+    if node.kind() == "new_expression"
+        && placeholder_message
+        && (compact.contains("error(") || compact.contains("exception("))
+    {
+        return Some("not implemented");
+    }
+    matches!(node.kind(), "raise_statement" | "throw_statement")
+        .then_some(compact)
+        .filter(|statement| {
+            statement.contains("notimplementederror")
+                || statement.contains("notimplementedexception")
+                || statement.contains("unimplementederror")
+        })
+        .map(|_| "not implemented")
+}
+
+pub fn scan_project(
+    root: &Path,
+    config: &ScanConfig,
+    options: &ScanOptions,
+) -> Result<Vec<Finding>> {
+    scan_project_inner(root, config, options, None)
+}
+
+pub(crate) fn scan_changed_project(
+    root: &Path,
+    config: &ScanConfig,
+    scope: &ChangedScope,
+) -> Result<Vec<Finding>> {
+    scan_project_inner(
+        root,
+        config,
+        &ScanOptions {
+            paths: Some(scope.paths.clone()),
+        },
+        Some(scope),
+    )
+}
+
+fn scan_project_inner(
+    root: &Path,
+    config: &ScanConfig,
+    options: &ScanOptions,
+    scope: Option<&ChangedScope>,
+) -> Result<Vec<Finding>> {
+    if !config.enabled {
+        return Ok(Vec::new());
+    }
+
+    let mut analyzer = Analyzer::new()?;
+    let mut findings = Vec::new();
+    let files = collect_source_files(root, config, options)?;
+    let project_files = if options.paths.is_some() {
+        collect_source_files(root, config, &ScanOptions::default())?
+    } else {
+        files.clone()
+    };
+    let code_files = project_files
+        .iter()
+        .filter(|path| {
+            is_supported_source(path)
+                && fs::metadata(path).is_ok_and(|metadata| metadata.len() <= config.max_file_bytes)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let semantic = SemanticIndex::build(&code_files, config);
+
+    for path in &files {
+        let metadata =
+            fs::metadata(path).with_context(|| format!("failed to inspect {}", path.display()))?;
+        if metadata.len() > config.max_file_bytes {
+            continue;
+        }
+        let Ok(source) = fs::read_to_string(path) else {
+            continue;
+        };
+        let mut file_findings = Vec::new();
+        analyzer.scan_file(root, path, &source, &semantic, config, &mut file_findings);
+        apply_inline_suppressions(&source, &mut file_findings);
+        findings.extend(file_findings);
+    }
+
+    let focus_paths = options.paths.as_ref().map(|_| {
+        files
+            .iter()
+            .map(|path| path.strip_prefix(root).unwrap_or(path).to_path_buf())
+            .collect::<BTreeSet<_>>()
+    });
+    findings.extend(scan_duplicate_blocks(
+        root,
+        &code_files,
+        config.duplicate_block_lines,
+        focus_paths.as_ref(),
+    ));
+    if let Some(scope) = scope {
+        findings.retain(|finding| {
+            let finding_end = finding.end_line.unwrap_or(finding.line);
+            scope.lines.get(&finding.path).is_some_and(|ranges| {
+                ranges
+                    .iter()
+                    .any(|(start, end)| finding.line <= *end && finding_end >= *start)
+            })
+        });
+    }
+    findings.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then(left.line.cmp(&right.line))
+            .then(left.rule_id.cmp(&right.rule_id))
+    });
+    Ok(findings)
+}
+
+fn apply_inline_suppressions(source: &str, findings: &mut Vec<Finding>) {
+    let mut allowed = HashSet::new();
+    for (index, line) in source.lines().enumerate() {
+        let Some(marker) = line.split("forgeguard: allow ").nth(1) else {
+            continue;
+        };
+        let Some((rule_id, reason)) = marker.split_once(" -- ") else {
+            continue;
+        };
+        if rule_id.starts_with("FG-") && !reason.trim().is_empty() {
+            allowed.insert((index + 1, rule_id.trim().to_owned()));
+            allowed.insert((index + 2, rule_id.trim().to_owned()));
+        }
+    }
+    findings.retain(|finding| {
+        finding.severity == Severity::Error
+            || !allowed.contains(&(finding.line, finding.rule_id.clone()))
+    });
+}
+
+pub(crate) fn collect_source_files(
+    root: &Path,
+    config: &ScanConfig,
+    options: &ScanOptions,
+) -> Result<Vec<std::path::PathBuf>> {
+    if let Some(paths) = &options.paths {
+        let include_tests = config.include_tests;
+        return Ok(paths
+            .iter()
+            .map(|path| {
+                if path.is_absolute() {
+                    path.clone()
+                } else {
+                    root.join(path)
+                }
+            })
+            .filter(|path| {
+                path.is_file()
+                    && is_scannable(path)
+                    && !is_builtin_excluded(path)
+                    && !config
+                        .extra_excludes
+                        .iter()
+                        .any(|fragment| path.to_string_lossy().contains(fragment))
+                    && (include_tests || !is_test_path(path))
+            })
+            .collect());
+    }
+
+    let include_tests = config.include_tests;
+    let extra_excludes = config.extra_excludes.clone();
+    let mut builder = WalkBuilder::new(root);
+    builder
+        .hidden(false)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .filter_entry(move |entry| {
+            let path = entry.path();
+            !is_builtin_excluded(path)
+                && !extra_excludes
+                    .iter()
+                    .any(|fragment| path.to_string_lossy().contains(fragment))
+                && (include_tests || !is_test_path(path))
+        });
+
+    let mut files = Vec::new();
+    for entry in builder.build() {
+        let entry = entry.context("failed while walking project files")?;
+        if entry.file_type().is_some_and(|kind| kind.is_file()) && is_scannable(entry.path()) {
+            files.push(entry.into_path());
+        }
+    }
+    Ok(files)
+}
+
+fn is_builtin_excluded(path: &Path) -> bool {
+    path.components().any(|component| {
+        matches!(
+            component.as_os_str().to_str(),
+            Some(
+                ".git"
+                    | ".forgeguard"
+                    | "node_modules"
+                    | "target"
+                    | "dist"
+                    | "build"
+                    | "coverage"
+                    | "vendor"
+                    | ".next"
+                    | ".turbo"
+            )
+        )
+    })
+}
+
+pub(crate) fn is_test_path(path: &Path) -> bool {
+    let has_test_directory = path.components().any(|component| {
+        matches!(
+            component
+                .as_os_str()
+                .to_str()
+                .map(str::to_ascii_lowercase)
+                .as_deref(),
+            Some("test" | "tests" | "__tests__")
+        )
+    });
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    has_test_directory
+        || file_name.ends_with("_test.go")
+        || file_name.ends_with("_test.rs")
+        || file_name.contains(".test.")
+        || file_name.contains(".spec.")
+}
+
+/// Markup, data, and documentation files parse, but they hold no executable
+/// lines, so a change to one never demands test coverage.
+pub(crate) fn is_markup_or_data(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|value| value.to_str()),
+        Some("html" | "htm" | "css" | "json" | "yaml" | "yml" | "toml" | "md" | "markdown" | "mk")
+    )
+}
+
+/// Source whose changed lines a coverage report can be expected to cover.
+pub(crate) fn is_coverable_source(path: &Path) -> bool {
+    is_supported_source(path) && !is_markup_or_data(path)
+}
+
+pub(crate) fn is_supported_source(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|value| value.to_str()),
+        Some(
+            "rs" | "go"
+                | "py"
+                | "pyi"
+                | "js"
+                | "jsx"
+                | "mjs"
+                | "cjs"
+                | "ts"
+                | "tsx"
+                | "mts"
+                | "cts"
+                | "java"
+                | "kt"
+                | "kts"
+                | "swift"
+                | "dart"
+                | "sql"
+                | "rb"
+                | "php"
+                | "cs"
+                | "cpp"
+                | "cc"
+                | "cxx"
+                | "c"
+                | "h"
+                | "hpp"
+                | "sh"
+                | "bash"
+                | "zsh"
+                | "astro"
+                | "fish"
+                | "lua"
+                | "ex"
+                | "exs"
+                | "erl"
+                | "hrl"
+                | "scala"
+                | "sc"
+                | "r"
+                | "tf"
+                | "hcl"
+                | "sol"
+                | "zig"
+                | "vue"
+                | "svelte"
+                | "proto"
+                | "html"
+                | "htm"
+                | "css"
+                | "json"
+                | "yaml"
+                | "yml"
+                | "toml"
+                | "md"
+                | "markdown"
+                | "ml"
+                | "hs"
+                | "jl"
+                | "pl"
+                | "pm"
+                | "groovy"
+                | "gradle"
+                | "m"
+                | "mm"
+                | "v"
+                | "sv"
+                | "svh"
+                | "mk"
+        )
+    )
+}
+
+fn is_scannable(path: &Path) -> bool {
+    is_supported_source(path) || is_secret_text_file(path)
+}
+
+fn is_secret_text_file(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    name == "dockerfile"
+        || name.starts_with(".env")
+        || matches!(
+            path.extension()
+                .and_then(|value| value.to_str())
+                .map(str::to_ascii_lowercase)
+                .as_deref(),
+            Some("yaml" | "yml" | "json" | "toml" | "ini" | "conf" | "properties")
+        )
+}
+
+/// A data literal spanning this many source lines is almost always embedded
+/// fixture/mock data that belongs in its own file rather than mixed into logic.
+const MAX_DATA_LITERAL_LINES: usize = 80;
+/// Or this many top-level elements/entries, for dense single-line-ish dumps.
+const MAX_DATA_LITERAL_ELEMENTS: usize = 50;
+const MAX_FUNCTION_COMPLEXITY: usize = 15;
+
+struct Analyzer {
+    select_all: Regex,
+    hardcoded_secret: Regex,
+    weak_crypto_tls: Regex,
+    script_block: Regex,
+    ts_lang: Regex,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct SinkSet(u8);
+
+impl SinkSet {
+    const DATABASE: Self = Self(1);
+    const NETWORK: Self = Self(2);
+
+    fn contains(self, other: Self) -> bool {
+        self.0 & other.0 != 0
+    }
+
+    fn insert(&mut self, other: Self) -> bool {
+        let previous = self.0;
+        self.0 |= other.0;
+        self.0 != previous
+    }
+}
+
+#[derive(Default)]
+struct FileProvenance {
+    database_symbols: HashSet<String>,
+    network_symbols: HashSet<String>,
+    local_symbols: HashSet<String>,
+}
+
+impl FileProvenance {
+    fn from_source(profile: LanguageProfile, source: &str) -> Self {
+        let mut provenance = Self::default();
+        for line in source.lines() {
+            let lower = line.to_ascii_lowercase();
+            let trimmed = line.trim_start();
+            let import_like = trimmed.starts_with("import ")
+                || trimmed.starts_with("from ")
+                || trimmed.starts_with("use ")
+                || trimmed.contains("require(");
+            if import_like {
+                let declaration = line.split(['\"', '\'']).next().unwrap_or(line);
+                provenance.local_symbols.extend(
+                    identifiers(declaration)
+                        .into_iter()
+                        .filter(|word| !binding_keywords().contains(&word.as_str())),
+                );
+                if let Some(path) = quoted_value(line) {
+                    if let Some(name) = path.rsplit('/').next() {
+                        provenance
+                            .local_symbols
+                            .insert(name.replace(['-', '.'], "_"));
+                    }
+                }
+            }
+            // forgeguard: allow FG-ALG-001 -- semantic package catalogs are fixed at eight entries or fewer
+            for (package, kind) in semantic_packages(profile) {
+                if !import_like || !contains_package(&lower, package) {
+                    continue;
+                }
+                let declaration = line.split(['\"', '\'']).next().unwrap_or(line);
+                let symbols = identifiers(declaration)
+                    .into_iter()
+                    .filter(|word| !binding_keywords().contains(&word.as_str()));
+                let target = if *kind == SinkSet::DATABASE {
+                    &mut provenance.database_symbols
+                } else {
+                    &mut provenance.network_symbols
+                };
+                target.extend(symbols);
+                if let Some(default) = package
+                    .rsplit('/')
+                    .next()
+                    .and_then(|part| part.rsplit('.').next())
+                {
+                    target.insert(default.replace('-', "_"));
+                }
+            }
+        }
+        if matches!(
+            profile,
+            LanguageProfile::JavaScript | LanguageProfile::TypeScript | LanguageProfile::Tsx
+        ) {
+            provenance.network_symbols.insert("fetch".to_owned());
+        }
+
+        // Resolve direct assignments such as `const prisma = new PrismaClient()`
+        // and `db, err := sql.Open(...)`. This stays lexical and path-insensitive.
+        for _ in 0..4 {
+            let mut changed = false;
+            // forgeguard: allow FG-ALG-001 -- assignment propagation is capped at four passes
+            for line in source.lines() {
+                let Some((left, right)) = line.split_once('=') else {
+                    continue;
+                };
+                // forgeguard: allow FG-ALG-002 -- keyword catalog is a fixed nine-entry slice
+                let Some(binding) = identifiers(left)
+                    .into_iter()
+                    .find(|word| !binding_keywords().contains(&word.as_str()))
+                else {
+                    continue;
+                };
+                let right_symbols = identifiers(&without_strings(right));
+                if right_symbols
+                    .iter()
+                    .any(|word| provenance.database_symbols.contains(word))
+                {
+                    changed |= provenance.database_symbols.insert(binding.clone());
+                }
+                if right_symbols
+                    .iter()
+                    .any(|word| provenance.network_symbols.contains(word))
+                {
+                    changed |= provenance.network_symbols.insert(binding);
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        provenance
+    }
+
+    fn classify(&self, callee: &str, method: &str) -> SinkSet {
+        let parts = identifiers(callee);
+        let mut sinks = SinkSet::default();
+        if parts
+            .iter()
+            .any(|part| self.database_symbols.contains(part))
+            && database_methods().contains(&normalized_method(method).as_str())
+        {
+            sinks.insert(SinkSet::DATABASE);
+        }
+        if parts.iter().any(|part| self.network_symbols.contains(part))
+            && network_methods().contains(&normalized_method(method).as_str())
+        {
+            sinks.insert(SinkSet::NETWORK);
+        }
+        sinks
+    }
+}
+
+#[derive(Default)]
+struct SemanticIndex {
+    files: HashMap<std::path::PathBuf, FileProvenance>,
+    functions: HashMap<String, SinkSet>,
+    authorized_functions: HashSet<String>,
+    taint_source_functions: HashSet<String>,
+}
+
+struct FunctionDraft {
+    name: String,
+    sinks: SinkSet,
+    calls: Vec<String>,
+    authorized: bool,
+    source: bool,
+    source_calls: Vec<String>,
+}
+
+fn collect_function_drafts(
+    root: Node<'_>,
+    source: &str,
+    profile: LanguageProfile,
+    provenance: &FileProvenance,
+    drafts: &mut Vec<FunctionDraft>,
+    counts: &mut HashMap<String, usize>,
+    config: &ScanConfig,
+) {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if profile.is_function(node.kind()) {
+            let Some(name) = node
+                .child_by_field_name("name")
+                .map(|name| node_text(name, source).to_owned())
+            else {
+                continue;
+            };
+            let body = node.child_by_field_name("body").unwrap_or(node);
+            let mut sinks = SinkSet::default();
+            let mut calls = Vec::new();
+            let mut authorized = false;
+            let mut taint_source = false;
+            let mut source_calls = Vec::new();
+            let mut body_stack = vec![body];
+            // forgeguard: allow FG-ALG-001 -- function bodies are disjoint; nested functions are skipped here
+            while let Some(child) = body_stack.pop() {
+                if child != body && profile.is_function(child.kind()) {
+                    continue;
+                }
+                if let Some(callee) = call_name(child, source) {
+                    let method = terminal_name(callee);
+                    sinks.insert(provenance.classify(callee, method));
+                    calls.push(method.to_owned());
+                    authorized |= contains_access_control(callee);
+                }
+                if matches!(child.kind(), "return_statement" | "return_expression") {
+                    taint_source |= expression_is_taint_source(
+                        node_text(child, source),
+                        config,
+                        &SemanticIndex::default(),
+                        Path::new(""),
+                    );
+                    let mut return_stack = vec![child];
+                    while let Some(return_child) = return_stack.pop() {
+                        if let Some(callee) = call_name(return_child, source) {
+                            source_calls.push(terminal_name(callee).to_owned());
+                        }
+                        return_stack.extend(
+                            (0..return_child.named_child_count())
+                                .filter_map(|index| return_child.named_child(index as u32)),
+                        );
+                    }
+                }
+                body_stack.extend(
+                    (0..child.named_child_count())
+                        .filter_map(|index| child.named_child(index as u32)),
+                );
+            }
+            *counts.entry(name.clone()).or_default() += 1;
+            drafts.push(FunctionDraft {
+                name,
+                sinks,
+                calls,
+                authorized,
+                source: taint_source,
+                source_calls,
+            });
+        }
+        stack.extend(
+            (0..node.named_child_count()).filter_map(|index| node.named_child(index as u32)),
+        );
+    }
+}
+
+fn semantic_packages(profile: LanguageProfile) -> &'static [(&'static str, SinkSet)] {
+    const JS: &[(&str, SinkSet)] = &[
+        ("@prisma/client", SinkSet::DATABASE),
+        ("sequelize", SinkSet::DATABASE),
+        ("typeorm", SinkSet::DATABASE),
+        ("drizzle-orm", SinkSet::DATABASE),
+        ("mongoose", SinkSet::DATABASE),
+        ("axios", SinkSet::NETWORK),
+        ("undici", SinkSet::NETWORK),
+    ];
+    const PYTHON: &[(&str, SinkSet)] = &[
+        ("sqlalchemy", SinkSet::DATABASE),
+        ("django.db", SinkSet::DATABASE),
+        ("psycopg", SinkSet::DATABASE),
+        ("asyncpg", SinkSet::DATABASE),
+        ("requests", SinkSet::NETWORK),
+        ("httpx", SinkSet::NETWORK),
+        ("aiohttp", SinkSet::NETWORK),
+        ("urllib", SinkSet::NETWORK),
+    ];
+    const RUST: &[(&str, SinkSet)] = &[
+        ("sqlx", SinkSet::DATABASE),
+        ("diesel", SinkSet::DATABASE),
+        ("sea_orm", SinkSet::DATABASE),
+        ("reqwest", SinkSet::NETWORK),
+        ("hyper", SinkSet::NETWORK),
+    ];
+    const GO: &[(&str, SinkSet)] = &[
+        ("database/sql", SinkSet::DATABASE),
+        ("jmoiron/sqlx", SinkSet::DATABASE),
+        ("gorm.io/gorm", SinkSet::DATABASE),
+        ("net/http", SinkSet::NETWORK),
+    ];
+    match profile {
+        LanguageProfile::JavaScript | LanguageProfile::TypeScript | LanguageProfile::Tsx => JS,
+        LanguageProfile::Python => PYTHON,
+        LanguageProfile::Rust => RUST,
+        LanguageProfile::Go => GO,
+        _ => &[],
+    }
+}
+
+fn identifiers(value: &str) -> Vec<String> {
+    value
+        .split(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
+        .filter(|part| {
+            !part.is_empty()
+                && part
+                    .as_bytes()
+                    .first()
+                    .is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_')
+        })
+        .map(str::to_owned)
+        .collect()
+}
+
+fn contains_package(source: &str, package: &str) -> bool {
+    source.match_indices(package).any(|(start, _)| {
+        let before = source[..start].chars().next_back();
+        let after = source[start + package.len()..].chars().next();
+        !before.is_some_and(package_identifier_character)
+            && !after.is_some_and(package_identifier_character)
+    })
+}
+
+fn package_identifier_character(character: char) -> bool {
+    character.is_ascii_alphanumeric() || matches!(character, '_' | '-')
+}
+
+fn quoted_value(line: &str) -> Option<&str> {
+    for quote in ['\"', '\''] {
+        if let Some((_, rest)) = line.split_once(quote) {
+            if let Some((value, _)) = rest.split_once(quote) {
+                return Some(value);
+            }
+        }
+    }
+    None
+}
+
+fn without_strings(value: &str) -> String {
+    let mut quote = None;
+    value
+        .chars()
+        .map(|character| match quote {
+            Some(active) if character == active => {
+                quote = None;
+                ' '
+            }
+            Some(_) => ' ',
+            None if matches!(character, '\"' | '\'') => {
+                quote = Some(character);
+                ' '
+            }
+            None => character,
+        })
+        .collect()
+}
+
+fn binding_keywords() -> &'static [&'static str] {
+    &[
+        "as", "const", "from", "import", "let", "mut", "require", "use", "var",
+    ]
+}
+
+fn database_methods() -> &'static [&'static str] {
+    &[
+        "create",
+        "delete",
+        "execute",
+        "fetch",
+        "fetchall",
+        "fetchone",
+        "findfirst",
+        "findmany",
+        "findunique",
+        "insert",
+        "insertinto",
+        "open",
+        "query",
+        "save",
+        "update",
+    ]
+}
+
+fn network_methods() -> &'static [&'static str] {
+    &[
+        "delete", "fetch", "get", "patch", "post", "put", "request", "send",
+    ]
+}
+
+impl SemanticIndex {
+    fn build(files: &[std::path::PathBuf], config: &ScanConfig) -> Self {
+        let mut index = Self::default();
+        let mut drafts = Vec::new();
+        let mut counts = HashMap::<String, usize>::new();
+        for path in files {
+            let Some(profile) =
+                LanguageProfile::from_path(path).filter(|profile| profile.has_semantic_pack())
+            else {
+                continue;
+            };
+            let Ok(source) = fs::read_to_string(path) else {
+                continue;
+            };
+            let mut provenance = FileProvenance::from_source(profile, &source);
+            let mut parser = Parser::new();
+            if parser.set_language(&profile.language()).is_err() {
+                continue;
+            }
+            let Some(tree) = parser
+                .parse(&source, None)
+                .filter(|tree| !tree.root_node().has_error())
+            else {
+                continue;
+            };
+            let draft_start = drafts.len();
+            collect_function_drafts(
+                tree.root_node(),
+                &source,
+                profile,
+                &provenance,
+                &mut drafts,
+                &mut counts,
+                config,
+            );
+            provenance
+                .local_symbols
+                .extend(drafts[draft_start..].iter().map(|draft| draft.name.clone()));
+            index.files.insert(path.clone(), provenance);
+        }
+
+        for draft in &drafts {
+            if counts.get(&draft.name) == Some(&1) {
+                index.functions.insert(draft.name.clone(), draft.sinks);
+                if draft.authorized {
+                    index.authorized_functions.insert(draft.name.clone());
+                }
+                if draft.source {
+                    index.taint_source_functions.insert(draft.name.clone());
+                }
+            }
+        }
+        for _ in 0..drafts.len().max(1) {
+            let mut changed = false;
+            // ponytail: project-wide fixed point is O(F × (F+E)); use SCC condensation if measured on huge projects
+            // forgeguard: allow FG-ALG-001 -- bounded by finite function/call graph and exits when no summary changes
+            for draft in &drafts {
+                if counts.get(&draft.name) != Some(&1) {
+                    continue;
+                }
+                let inherited = draft
+                    .calls
+                    .iter()
+                    .fold(SinkSet::default(), |mut sinks, call| {
+                        if let Some(summary) = index.functions.get(call) {
+                            sinks.insert(*summary);
+                        }
+                        sinks
+                    });
+                changed |= index
+                    .functions
+                    .entry(draft.name.clone())
+                    .or_default()
+                    .insert(inherited);
+                if draft
+                    .calls
+                    .iter()
+                    .any(|call| index.authorized_functions.contains(call))
+                {
+                    changed |= index.authorized_functions.insert(draft.name.clone());
+                }
+                if draft
+                    .source_calls
+                    .iter()
+                    .any(|call| index.taint_source_functions.contains(call))
+                {
+                    changed |= index.taint_source_functions.insert(draft.name.clone());
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        index
+    }
+
+    fn classify(&self, path: &Path, callee: &str, method: &str) -> SinkSet {
+        let mut sinks = self
+            .files
+            .get(path)
+            .map(|provenance| provenance.classify(callee, method))
+            .unwrap_or_default();
+        let terminal = terminal_name(callee);
+        if self
+            .files
+            .get(path)
+            .is_some_and(|provenance| provenance.local_symbols.contains(terminal))
+        {
+            if let Some(summary) = self.functions.get(terminal) {
+                sinks.insert(*summary);
+            }
+        }
+        sinks
+    }
+}
+
+impl Analyzer {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            select_all: Regex::new(r"(?xi)\bSELECT\s+\*\s+FROM\b")?,
+            hardcoded_secret: Regex::new(
+                r"(?x)(AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{36,255}|sk_(?:live|prod)_[A-Za-z0-9]{16,}|-----BEGIN\ (?:RSA\ |EC\ |OPENSSH\ )?PRIVATE\ KEY-----)",
+            )?,
+            weak_crypto_tls: Regex::new(
+                r#"(?xi)(createHash\s*\(\s*["'](?:md5|sha1)["']|hashlib\.(?:md5|sha1)\s*\(|MessageDigest\.getInstance\s*\(\s*["']SHA-?1["']|rejectUnauthorized\s*:\s*false|verify\s*=\s*false|SSLv3|PROTOCOL_TLSv1\b|TLSv1(?:\.0)?["'])"#,
+            )?,
+            script_block: Regex::new(r"(?is)<script\b[^>]*>(.*?)</script>")?,
+            ts_lang: Regex::new(r#"(?i)lang\s*=\s*["']?ts"#)?,
+        })
+    }
+
+    /// Svelte/Vue/Astro single-file components keep their imperative logic in
+    /// `<script>` blocks (and Astro's leading `---` frontmatter). Mask every
+    /// other byte with blanks — preserving line and column positions — and scan
+    /// the result as JavaScript or TypeScript so all existing rules apply to the
+    /// real logic instead of skipping the file.
+    fn extract_component_script(
+        &self,
+        path: &Path,
+        source: &str,
+    ) -> Option<(LanguageProfile, String)> {
+        let ext = path.extension().and_then(|value| value.to_str())?;
+        if !matches!(ext, "svelte" | "vue" | "astro") {
+            return None;
+        }
+        let mut regions: Vec<(usize, usize)> = Vec::new();
+        let mut typescript = ext == "astro";
+        if ext == "astro" {
+            if let Some(rest) = source.strip_prefix("---") {
+                if let Some(end) = rest.find("\n---") {
+                    regions.push((3, 3 + end));
+                }
+            }
+        }
+        for caps in self.script_block.captures_iter(source) {
+            let tag = caps.get(0)?;
+            let body = caps.get(1)?;
+            if self.ts_lang.is_match(&source[tag.start()..body.start()]) {
+                typescript = true;
+            }
+            regions.push((body.start(), body.end()));
+        }
+        if regions.is_empty() {
+            return None;
+        }
+        let profile = if typescript {
+            LanguageProfile::TypeScript
+        } else {
+            LanguageProfile::JavaScript
+        };
+        Some((profile, mask_outside(source, &regions)))
+    }
+
+    // forgeguard: allow FG-CPLX-001 -- legacy analyzer traversal; this change only scans secrets before the syntax-error return
+    fn scan_file(
+        &mut self,
+        root: &Path,
+        path: &Path,
+        source: &str,
+        semantic: &SemanticIndex,
+        config: &ScanConfig,
+        findings: &mut Vec<Finding>,
+    ) {
+        let relative = path.strip_prefix(root).unwrap_or(path).to_path_buf();
+        if is_secret_text_file(path) {
+            self.scan_text_secrets(&relative, source, findings);
+            return;
+        }
+        let component = self.extract_component_script(path, source);
+        let (profile, source, emit_parse_errors) = match component.as_ref() {
+            Some((profile, masked)) => (*profile, masked.as_str(), false),
+            None => match LanguageProfile::from_path(path) {
+                Some(profile) => (profile, source, true),
+                None => {
+                    if path.extension().and_then(|value| value.to_str()) == Some("sql") {
+                        self.scan_sql(&relative, source, findings);
+                    }
+                    return;
+                }
+            },
+        };
+        let mut parser = Parser::new();
+        if parser.set_language(&profile.language()).is_err() {
+            if emit_parse_errors {
+                findings.push(parse_finding(
+                    &relative,
+                    "language grammar could not be loaded",
+                ));
+            }
+            return;
+        }
+        let Some(tree) = parser.parse(source, None) else {
+            if emit_parse_errors {
+                findings.push(parse_finding(&relative, "source could not be parsed"));
+            }
+            return;
+        };
+        self.scan_secrets(&relative, source, tree.root_node(), findings);
+        if tree.root_node().has_error() {
+            if emit_parse_errors {
+                findings.push(parse_finding(
+                    &relative,
+                    "source contains syntax errors; structural checks skipped",
+                ));
+            }
+            return;
+        }
+
+        let mut stack = vec![(tree.root_node(), 0usize)];
+        while let Some((node, loop_depth)) = stack.pop() {
+            let weak_call = call_name(node, source).is_some_and(|callee| {
+                matches!(
+                    terminal_name(&callee.to_ascii_lowercase()),
+                    "createhash" | "md5" | "sha1" | "getinstance"
+                ) && self.weak_crypto_tls.is_match(node_text(node, source))
+            });
+            let weak_tls = matches!(
+                node.kind(),
+                "pair" | "assignment" | "assignment_expression" | "keyword_argument"
+            ) && self.weak_crypto_tls.is_match(node_text(node, source));
+            if weak_call || weak_tls {
+                findings.push(finding_for_node(
+                    "FG-SEC-004",
+                    "Weak cryptography or TLS configuration",
+                    Severity::Warning,
+                    &relative,
+                    node,
+                    source,
+                    "Use a modern password KDF or SHA-256+ as appropriate, TLS 1.2+, and keep certificate verification enabled.",
+                ));
+            }
+            if is_exception_handler(node.kind()) && exception_is_swallowed(node, source) {
+                findings.push(finding_for_node(
+                    "FG-ERR-001",
+                    "Exception is swallowed",
+                    Severity::Warning,
+                    &relative,
+                    node,
+                    source,
+                    "Handle, return, or rethrow the exception; an empty handler hides failures.",
+                ));
+            }
+            if is_xss_assignment(node, source) {
+                if let Some(value) = assignment_value(node) {
+                    if taint_reaches(
+                        value,
+                        source,
+                        profile,
+                        TaintSink::Html,
+                        config,
+                        semantic,
+                        path,
+                    ) {
+                        findings.push(finding_for_node(
+                            "FG-SEC-006",
+                            "Tainted data reaches an HTML sink",
+                            Severity::Warning,
+                            &relative,
+                            node,
+                            source,
+                            "Use a context-aware HTML sanitizer or a text-only DOM API before rendering untrusted data.",
+                        ));
+                    }
+                }
+            }
+            if is_complexity_scope(node.kind()) {
+                let complexity = function_complexity(node);
+                if complexity > MAX_FUNCTION_COMPLEXITY {
+                    let mut complexity_finding = finding(
+                        "FG-CPLX-001",
+                        "High function complexity",
+                        Severity::Warning,
+                        &relative,
+                        node.start_position().row + 1,
+                        &format!("structural complexity {complexity} exceeds {MAX_FUNCTION_COMPLEXITY}"),
+                        "Split independent decisions or simplify control flow while preserving behavior.",
+                    );
+                    complexity_finding.end_line = Some(node.end_position().row + 1);
+                    findings.push(complexity_finding);
+                }
+            }
+            let starts_loop = profile.is_loop(node.kind())
+                || call_name(node, source).is_some_and(|callee| profile.is_iteration_call(callee));
+            if starts_loop && loop_depth > 0 && !has_static_bound(node, source) {
+                findings.push(finding_for_node(
+                    "FG-ALG-001",
+                    "Potential nested iteration",
+                    Severity::Warning,
+                    &relative,
+                    node,
+                    source,
+                    "Review both input bounds. Pre-index independent collections when nested traversal can grow multiplicatively.",
+                ));
+            }
+
+            if let Some(callee) = call_name(node, source) {
+                let in_loop = loop_depth > 0;
+                let method = terminal_name(callee);
+                let semantic_sinks = semantic.classify(path, callee, method);
+                if is_unsafe_deserialization(callee, node_text(node, source)) {
+                    findings.push(finding_for_node(
+                        "FG-SEC-005",
+                        "Unsafe deserialization",
+                        Severity::Warning,
+                        &relative,
+                        node,
+                        source,
+                        "Use a safe data format or the library's restricted/safe loader; never deserialize untrusted objects.",
+                    ));
+                }
+                if is_mutating_route(callee)
+                    && !route_has_access_control(node_text(node, source), semantic, path)
+                {
+                    findings.push(finding_for_node(
+                        "FG-AUTH-001",
+                        "Mutating route requires access-control review",
+                        Severity::Info,
+                        &relative,
+                        node,
+                        source,
+                        "Verify authentication and object/action authorization are enforced by this route or inherited middleware.",
+                    ));
+                }
+                if in_loop && profile.is_linear_lookup(method) {
+                    findings.push(finding_for_node(
+                        "FG-ALG-002",
+                        "Repeated linear lookup inside iteration",
+                        Severity::Warning,
+                        &relative,
+                        node,
+                        source,
+                        "Pre-index the lookup collection with a map or set when its size can grow.",
+                    ));
+                }
+                if in_loop && semantic_sinks.contains(SinkSet::DATABASE) {
+                    findings.push(finding_for_node(
+                        "FG-DB-001",
+                        "Database operation inside iteration",
+                        Severity::Error,
+                        &relative,
+                        node,
+                        source,
+                        "Replace per-item database access with a set-based query, join, eager load, prefetch, or bulk operation.",
+                    ));
+                } else if in_loop && is_database_call(callee, method) {
+                    findings.push(finding_for_node(
+                        "FG-DB-002",
+                        "Potential database operation inside iteration",
+                        Severity::Info,
+                        &relative,
+                        node,
+                        source,
+                        "Confirm receiver provenance. Batch the operation if it performs database I/O.",
+                    ));
+                }
+                if in_loop && semantic_sinks.contains(SinkSet::NETWORK) {
+                    findings.push(finding_for_node(
+                        "FG-NET-001",
+                        "External request inside iteration",
+                        Severity::Warning,
+                        &relative,
+                        node,
+                        source,
+                        "Use API batching or bounded concurrency with timeouts and partial-failure handling.",
+                    ));
+                } else if in_loop && is_network_call(callee, method) {
+                    findings.push(finding_for_node(
+                        "FG-NET-002",
+                        "Potential external request inside iteration",
+                        Severity::Info,
+                        &relative,
+                        node,
+                        source,
+                        "Confirm receiver provenance. Batch or bound concurrency if this performs network I/O.",
+                    ));
+                }
+                if in_loop
+                    && matches!(
+                        method,
+                        "sort"
+                            | "Sort"
+                            | "sort_by"
+                            | "sort_unstable"
+                            | "sort_unstable_by"
+                            | "sorted"
+                    )
+                {
+                    findings.push(finding_for_node(
+                        "FG-ALG-003",
+                        "Sorting inside iteration",
+                        Severity::Warning,
+                        &relative,
+                        node,
+                        source,
+                        "Move sorting outside the loop or use a heap or ordered structure.",
+                    ));
+                }
+                if is_unbounded_parallel(callee, node, source) {
+                    findings.push(finding_for_node(
+                        "FG-CON-001",
+                        "Potential unbounded parallel execution",
+                        Severity::Warning,
+                        &relative,
+                        node,
+                        source,
+                        "Use a bounded worker pool, semaphore, chunking, or an explicit concurrency limit.",
+                    ));
+                }
+                if is_database_call(callee, method)
+                    && self.select_all.is_match(node_text(node, source))
+                {
+                    findings.push(finding_for_node(
+                        "FG-DB-005",
+                        "Potential unnecessary SELECT *",
+                        Severity::Warning,
+                        &relative,
+                        node,
+                        source,
+                        "Select only columns required by the use case.",
+                    ));
+                }
+                if let Some(argument) = first_argument(node) {
+                    let html_tainted = is_xss_call(callee)
+                        && taint_reaches(
+                            argument,
+                            source,
+                            profile,
+                            TaintSink::Html,
+                            config,
+                            semantic,
+                            path,
+                        );
+                    if html_tainted {
+                        findings.push(finding_for_node(
+                            "FG-SEC-006",
+                            "Tainted data reaches an HTML sink",
+                            Severity::Warning,
+                            &relative,
+                            node,
+                            source,
+                            "Use a context-aware HTML sanitizer or a text-only rendering API.",
+                        ));
+                    }
+                    let path_tainted = is_filesystem_call(callee)
+                        && taint_reaches(
+                            argument,
+                            source,
+                            profile,
+                            TaintSink::Path,
+                            config,
+                            semantic,
+                            path,
+                        );
+                    if path_tainted {
+                        findings.push(finding_for_node(
+                            "FG-SEC-007",
+                            "Tainted path reaches a filesystem sink",
+                            Severity::Info,
+                            &relative,
+                            node,
+                            source,
+                            "Resolve against an allowed root and reject paths that escape it before filesystem access.",
+                        ));
+                    }
+                    let sensitive = is_dynamic_execution(callee)
+                        || is_filesystem_call(callee)
+                        || is_database_call(callee, method)
+                        || is_network_call(callee, method)
+                        || semantic_sinks.contains(SinkSet::DATABASE)
+                        || semantic_sinks.contains(SinkSet::NETWORK);
+                    if sensitive && !is_literal(argument) {
+                        let sink = if is_dynamic_execution(callee) {
+                            TaintSink::Command
+                        } else if is_database_call(callee, method)
+                            || semantic_sinks.contains(SinkSet::DATABASE)
+                        {
+                            TaintSink::Query
+                        } else {
+                            TaintSink::Network
+                        };
+                        if !is_filesystem_call(callee)
+                            && taint_reaches(
+                                argument, source, profile, sink, config, semantic, path,
+                            )
+                        {
+                            findings.push(finding_for_node(
+                                "FG-SEC-003",
+                                "Tainted function data reaches a sensitive sink",
+                                Severity::Info,
+                                &relative,
+                                node,
+                                source,
+                                "Validate or constrain the parameter before it reaches the command, query, path, or URL sink.",
+                            ));
+                        } else if is_dynamic_execution(callee) {
+                            findings.push(finding_for_node(
+                                "FG-SEC-002",
+                                "Dynamic sensitive operation",
+                                Severity::Info,
+                                &relative,
+                                node,
+                                source,
+                                "Confirm the value cannot be attacker-controlled; prefer structured APIs over dynamic evaluation or shell execution.",
+                            ));
+                        }
+                    }
+                }
+            }
+
+            if profile.is_data_literal(node.kind())
+                && !node
+                    .parent()
+                    .is_some_and(|parent| profile.is_data_literal(parent.kind()))
+            {
+                let span = node
+                    .end_position()
+                    .row
+                    .saturating_sub(node.start_position().row);
+                if span >= MAX_DATA_LITERAL_LINES
+                    || node.named_child_count() >= MAX_DATA_LITERAL_ELEMENTS
+                {
+                    findings.push(finding_for_node(
+                        "FG-ARCH-001",
+                        "Large inline data literal",
+                        Severity::Warning,
+                        &relative,
+                        node,
+                        source,
+                        "Move large fixed datasets or mock data into a dedicated data/fixture file, JSON, or loader; keep modules and components focused on logic.",
+                    ));
+                }
+            }
+
+            let child_loop_depth = loop_depth + usize::from(starts_loop);
+            stack.extend(
+                (0..node.named_child_count())
+                    .rev()
+                    .filter_map(|index| node.named_child(index as u32))
+                    .map(|child| (child, child_loop_depth)),
+            );
+        }
+    }
+
+    fn scan_secrets(&self, path: &Path, source: &str, root: Node<'_>, findings: &mut Vec<Finding>) {
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            let string_like = node.kind().contains("string") || node.kind().contains("heredoc");
+            let nested_string = node.parent().is_some_and(|parent| {
+                parent.kind().contains("string") || parent.kind().contains("heredoc")
+            });
+            if string_like
+                && !nested_string
+                && self.hardcoded_secret.is_match(node_text(node, source))
+            {
+                findings.push(finding(
+                    "FG-SEC-001",
+                    "Hardcoded credential",
+                    Severity::Error,
+                    path,
+                    node.start_position().row + 1,
+                    "credential-like value embedded in source (redacted)",
+                    "Remove and rotate the credential; load it from the platform's secret store or environment.",
+                ));
+            }
+            stack.extend(
+                (0..node.named_child_count()).filter_map(|index| node.named_child(index as u32)),
+            );
+        }
+    }
+
+    fn scan_text_secrets(&self, path: &Path, source: &str, findings: &mut Vec<Finding>) {
+        for (index, line) in source.lines().enumerate() {
+            let trimmed = line.trim_start();
+            if !trimmed.starts_with(['#', ';'])
+                && !trimmed.starts_with("//")
+                && self.hardcoded_secret.is_match(line)
+            {
+                findings.push(finding(
+                    "FG-SEC-001",
+                    "Hardcoded credential",
+                    Severity::Error,
+                    path,
+                    index + 1,
+                    "credential-like value embedded in configuration (redacted)",
+                    "Remove and rotate the credential; load it from the platform's secret store or environment.",
+                ));
+            }
+        }
+    }
+
+    fn scan_sql(&self, path: &Path, source: &str, findings: &mut Vec<Finding>) {
+        let mut line = 1;
+        let mut previous_start = 0;
+        for matched in self.select_all.find_iter(source) {
+            line += source[previous_start..matched.start()]
+                .bytes()
+                .filter(|byte| *byte == b'\n')
+                .count();
+            previous_start = matched.start();
+            findings.push(finding(
+                "FG-DB-005",
+                "Potential unnecessary SELECT *",
+                Severity::Warning,
+                path,
+                line,
+                matched.as_str(),
+                "Select only columns required by the use case.",
+            ));
+        }
+    }
+}
+
+fn function_complexity(function: Node<'_>) -> usize {
+    let mut complexity = 1;
+    let mut stack = (0..function.named_child_count())
+        .filter_map(|index| function.named_child(index as u32))
+        .collect::<Vec<_>>();
+    while let Some(node) = stack.pop() {
+        if is_complexity_scope(node.kind()) {
+            continue;
+        }
+        if matches!(
+            node.kind(),
+            "if_statement"
+                | "if_expression"
+                | "elif_clause"
+                | "for_statement"
+                | "for_expression"
+                | "enhanced_for_statement"
+                | "foreach_statement"
+                | "while_statement"
+                | "while_expression"
+                | "do_statement"
+                | "do_while_statement"
+                | "repeat_while_statement"
+                | "catch_clause"
+                | "except_clause"
+                | "case_statement"
+                | "switch_case"
+                | "match_arm"
+                | "conditional_expression"
+        ) {
+            complexity += 1;
+        }
+        stack.extend(
+            (0..node.named_child_count()).filter_map(|index| node.named_child(index as u32)),
+        );
+    }
+    complexity
+}
+
+fn first_argument(call: Node<'_>) -> Option<Node<'_>> {
+    call.child_by_field_name("arguments")?.named_child(0)
+}
+
+fn is_literal(node: Node<'_>) -> bool {
+    node.kind().contains("string")
+        || matches!(
+            node.kind(),
+            "integer" | "float" | "true" | "false" | "none" | "null" | "nil"
+        )
+}
+
+fn is_dynamic_execution(callee: &str) -> bool {
+    let normalized = callee.to_ascii_lowercase();
+    matches!(
+        terminal_name(&normalized),
+        "eval" | "exec" | "system" | "popen" | "shell_exec"
+    ) || normalized.ends_with("child_process.exec")
+}
+
+fn is_filesystem_call(callee: &str) -> bool {
+    let normalized = callee.to_ascii_lowercase();
+    matches!(
+        terminal_name(&normalized),
+        "readfile" | "readfilesync" | "read_to_string"
+    ) || normalized.starts_with("fs.")
+        || normalized.starts_with("file::open")
+        || normalized.starts_with("std::fs::")
+}
+
+#[derive(Clone, Copy)]
+enum TaintSink {
+    Html,
+    Path,
+    Command,
+    Query,
+    Network,
+}
+
+fn taint_reaches(
+    argument: Node<'_>,
+    source: &str,
+    profile: LanguageProfile,
+    sink: TaintSink,
+    config: &ScanConfig,
+    semantic: &SemanticIndex,
+    path: &Path,
+) -> bool {
+    let mut parent = argument.parent();
+    while let Some(node) = parent {
+        if profile.is_function(node.kind()) || is_complexity_scope(node.kind()) {
+            let Some(parameters) = node.child_by_field_name("parameters") else {
+                return false;
+            };
+            let mut tainted = identifiers(node_text(parameters, source))
+                .into_iter()
+                .filter(|word| !binding_keywords().contains(&word.as_str()))
+                .collect::<HashSet<_>>();
+            let function_start = node.start_byte();
+            let argument_start = argument.start_byte();
+            let prefix = source
+                .get(function_start..argument_start)
+                .unwrap_or_default();
+            // forgeguard: allow FG-ALG-001 -- assignments are propagated over a bounded function prefix
+            for _ in 0..4 {
+                let mut changed = false;
+                // forgeguard: allow FG-ALG-001 -- four-pass cap over one bounded function prefix
+                for statement in prefix.lines() {
+                    if let Some((left, right)) = assignment_parts(statement) {
+                        // forgeguard: allow FG-ALG-002 -- keyword catalog is a fixed nine-entry slice
+                        let Some(binding) = identifiers(left)
+                            .into_iter()
+                            .rev()
+                            .find(|word| !binding_keywords().contains(&word.as_str()))
+                        else {
+                            continue;
+                        };
+                        if is_sanitized_expression(right, sink, config) {
+                            tainted.remove(&binding);
+                        } else if expression_is_tainted(right, &tainted, config, semantic, path) {
+                            changed |= tainted.insert(binding);
+                        }
+                    }
+                    if let Some(binding) =
+                        tainted_collection(statement, &tainted, config, semantic, path)
+                    {
+                        changed |= tainted.insert(binding);
+                    }
+                }
+                if !changed {
+                    break;
+                }
+            }
+            let argument_identifiers = identifiers(node_text(argument, source));
+            let argument = node_text(argument, source);
+            return !is_sanitized_expression(argument, sink, config)
+                && (argument_identifiers
+                    .iter()
+                    .any(|identifier| tainted.contains(identifier))
+                    || expression_is_taint_source(argument, config, semantic, path));
+        }
+        parent = node.parent();
+    }
+    false
+}
+
+fn assignment_parts(statement: &str) -> Option<(&str, &str)> {
+    if let Some(parts) = statement.split_once(":=") {
+        return Some(parts);
+    }
+    let bytes = statement.as_bytes();
+    for (index, byte) in bytes.iter().enumerate() {
+        if *byte != b'=' {
+            continue;
+        }
+        let before = index.checked_sub(1).and_then(|offset| bytes.get(offset));
+        let after = bytes.get(index + 1);
+        if before.is_some_and(|byte| matches!(*byte, b'=' | b'!' | b'<' | b'>'))
+            || after.is_some_and(|byte| matches!(*byte, b'=' | b'>'))
+        {
+            continue;
+        }
+        return Some((&statement[..index], &statement[index + 1..]));
+    }
+    None
+}
+
+fn expression_is_tainted(
+    value: &str,
+    tainted: &HashSet<String>,
+    config: &ScanConfig,
+    semantic: &SemanticIndex,
+    path: &Path,
+) -> bool {
+    expression_is_taint_source(value, config, semantic, path)
+        || identifiers(value)
+            .iter()
+            .any(|identifier| tainted.contains(identifier))
+}
+
+fn expression_is_taint_source(
+    value: &str,
+    config: &ScanConfig,
+    semantic: &SemanticIndex,
+    path: &Path,
+) -> bool {
+    let normalized = value.to_ascii_lowercase().replace(' ', "");
+    [
+        "req.body",
+        "req.query",
+        "req.params",
+        "request.body",
+        "request.args",
+        "request.form",
+        "event.body",
+        "location.search",
+        "document.cookie",
+    ]
+    .iter()
+    .any(|source| normalized.contains(source))
+        || ["readline", "input", "prompt", "getparameter", "formvalue"]
+            .iter()
+            .any(|source| contains_named_call(value, source))
+        || identifiers(value).iter().any(|identifier| {
+            config
+                .taint_sources
+                .iter()
+                .any(|source| identifier.eq_ignore_ascii_case(source))
+                || (semantic.taint_source_functions.contains(identifier)
+                    && semantic
+                        .files
+                        .get(path)
+                        .is_some_and(|file| file.local_symbols.contains(identifier)))
+        })
+}
+
+fn tainted_collection(
+    statement: &str,
+    tainted: &HashSet<String>,
+    config: &ScanConfig,
+    semantic: &SemanticIndex,
+    path: &Path,
+) -> Option<String> {
+    for marker in [".push(", ".append(", ".add(", ".insert("] {
+        let Some((receiver, arguments)) = statement.split_once(marker) else {
+            continue;
+        };
+        if expression_is_tainted(arguments, tainted, config, semantic, path) {
+            return identifiers(receiver).into_iter().next_back();
+        }
+    }
+    None
+}
+
+fn is_sanitized_expression(value: &str, sink: TaintSink, config: &ScanConfig) -> bool {
+    if config
+        .trusted_sanitizers
+        .iter()
+        .any(|sanitizer| contains_named_call(value, sanitizer))
+    {
+        return true;
+    }
+    match sink {
+        TaintSink::Html => [
+            "sanitizehtml",
+            "escapehtml",
+            "dompurify.sanitize",
+            "bleach.clean",
+        ]
+        .iter()
+        .any(|sanitizer| contains_named_call(value, sanitizer)),
+        TaintSink::Path => ["secure_filename", "sanitize_filename", "sanitizefilename"]
+            .iter()
+            .any(|sanitizer| contains_named_call(value, sanitizer)),
+        TaintSink::Command => ["shlex.quote", "shellescape"]
+            .iter()
+            .any(|sanitizer| contains_named_call(value, sanitizer)),
+        TaintSink::Query | TaintSink::Network => false,
+    }
+}
+
+fn contains_named_call(value: &str, name: &str) -> bool {
+    let normalized = value.to_ascii_lowercase().replace(char::is_whitespace, "");
+    let name = name
+        .trim()
+        .trim_end_matches('(')
+        .to_ascii_lowercase()
+        .replace(char::is_whitespace, "");
+    if name.is_empty() {
+        return false;
+    }
+    let needle = format!("{name}(");
+    normalized.match_indices(&needle).any(|(start, _)| {
+        start == 0
+            || !normalized[..start]
+                .chars()
+                .next_back()
+                .is_some_and(|character| character.is_ascii_alphanumeric() || character == '_')
+    })
+}
+
+fn is_exception_handler(kind: &str) -> bool {
+    matches!(kind, "catch_clause" | "except_clause" | "rescue")
+}
+
+fn exception_is_swallowed(node: Node<'_>, source: &str) -> bool {
+    let body = node
+        .child_by_field_name("body")
+        .or_else(|| node.named_child(node.named_child_count().saturating_sub(1) as u32));
+    let Some(body) = body else {
+        return true;
+    };
+    let compact = node_text(body, source)
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>();
+    matches!(compact.as_str(), "" | "{}" | "{;}" | "pass" | "pass;")
+}
+
+fn assignment_value(node: Node<'_>) -> Option<Node<'_>> {
+    node.child_by_field_name("right")
+        .or_else(|| node.child_by_field_name("value"))
+}
+
+fn is_xss_assignment(node: Node<'_>, source: &str) -> bool {
+    if !matches!(
+        node.kind(),
+        "assignment_expression" | "assignment" | "augmented_assignment_expression"
+    ) {
+        return false;
+    }
+    let left = node
+        .child_by_field_name("left")
+        .or_else(|| node.child_by_field_name("name"))
+        .map(|left| node_text(left, source).to_ascii_lowercase())
+        .unwrap_or_default();
+    left.ends_with(".innerhtml")
+        || left.ends_with(".outerhtml")
+        || left.contains("dangerouslysetinnerhtml")
+}
+
+fn is_xss_call(callee: &str) -> bool {
+    let normalized = callee.to_ascii_lowercase();
+    normalized.ends_with("document.write")
+        || matches!(
+            terminal_name(&normalized),
+            "insertadjacenthtml" | "render_template_string" | "markup"
+        )
+}
+
+fn is_unsafe_deserialization(callee: &str, expression: &str) -> bool {
+    let normalized = callee.to_ascii_lowercase();
+    (matches!(
+        normalized.as_str(),
+        "pickle.load" | "pickle.loads" | "marshal.load" | "marshal.loads" | "php.unserialize"
+    ) || matches!(
+        terminal_name(&normalized),
+        "unserialize" | "objectinputstream" | "deserialize"
+    ) || (normalized.ends_with("yaml.load")
+        && !expression.to_ascii_lowercase().contains("safeloader")))
+        && !normalized.ends_with("json.deserialize")
+}
+
+fn is_mutating_route(callee: &str) -> bool {
+    let normalized = callee.to_ascii_lowercase();
+    let mut parts = normalized.rsplit('.');
+    let method = parts.next().unwrap_or_default();
+    let receiver = parts.next().unwrap_or_default();
+    matches!(method, "post" | "put" | "patch" | "delete")
+        && matches!(
+            receiver,
+            "app" | "router" | "server" | "api" | "route" | "fastify"
+        )
+}
+
+fn contains_access_control(source: &str) -> bool {
+    identifiers(source).iter().any(|identifier| {
+        let identifier = identifier.to_ascii_lowercase();
+        identifier == "auth"
+            || identifier.ends_with("auth")
+            || identifier.starts_with("authoriz")
+            || ["permission", "policy", "role", "guard", "middleware"]
+                .iter()
+                .any(|marker| identifier.contains(marker))
+    })
+}
+
+fn route_has_access_control(source: &str, semantic: &SemanticIndex, path: &Path) -> bool {
+    contains_access_control(source)
+        || identifiers(source).iter().any(|identifier| {
+            semantic.authorized_functions.contains(identifier)
+                && semantic
+                    .files
+                    .get(path)
+                    .is_some_and(|file| file.local_symbols.contains(identifier))
+        })
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum LanguageProfile {
+    JavaScript,
+    TypeScript,
+    Tsx,
+    Rust,
+    Go,
+    Python,
+    Java,
+    Kotlin,
+    CSharp,
+    C,
+    Cpp,
+    Ruby,
+    Php,
+    Swift,
+    Dart,
+    Bash,
+    Zig,
+    Lua,
+    Scala,
+    Solidity,
+    Elixir,
+    Erlang,
+    RLang,
+    Hcl,
+    Html,
+    Css,
+    Json,
+    Yaml,
+    Toml,
+    Markdown,
+    Ocaml,
+    Haskell,
+    Julia,
+    Perl,
+    Groovy,
+    ObjectiveC,
+    Verilog,
+    Svelte,
+    Make,
+}
+
+impl LanguageProfile {
+    // forgeguard: allow FG-CPLX-001 -- flat dispatch table over the parser matrix, one arm per language
+    pub(crate) fn family(self) -> &'static str {
+        match self {
+            Self::JavaScript | Self::TypeScript | Self::Tsx => "javascript",
+            Self::Rust => "rust",
+            Self::Go => "go",
+            Self::Python => "python",
+            Self::Java => "java",
+            Self::Kotlin => "kotlin",
+            Self::CSharp => "csharp",
+            Self::C => "c",
+            Self::Cpp => "cpp",
+            Self::Ruby => "ruby",
+            Self::Php => "php",
+            Self::Swift => "swift",
+            Self::Dart => "dart",
+            Self::Bash => "shell",
+            Self::Zig => "zig",
+            Self::Lua => "lua",
+            Self::Scala => "scala",
+            Self::Solidity => "solidity",
+            Self::Elixir => "elixir",
+            Self::Erlang => "erlang",
+            Self::RLang => "r",
+            Self::Hcl => "hcl",
+            Self::Html => "html",
+            Self::Css => "css",
+            Self::Json => "json",
+            Self::Yaml => "yaml",
+            Self::Toml => "toml",
+            Self::Markdown => "markdown",
+            Self::Ocaml => "ocaml",
+            Self::Haskell => "haskell",
+            Self::Julia => "julia",
+            Self::Perl => "perl",
+            Self::Groovy => "groovy",
+            Self::ObjectiveC => "objc",
+            Self::Verilog => "verilog",
+            Self::Svelte => "svelte",
+            Self::Make => "make",
+        }
+    }
+
+    fn has_semantic_pack(self) -> bool {
+        matches!(
+            self,
+            Self::JavaScript | Self::TypeScript | Self::Tsx | Self::Python | Self::Rust | Self::Go
+        )
+    }
+
+    fn is_function(self, kind: &str) -> bool {
+        match self {
+            Self::JavaScript | Self::TypeScript | Self::Tsx => {
+                matches!(kind, "function_declaration" | "method_definition")
+            }
+            Self::Python => kind == "function_definition",
+            Self::Rust => kind == "function_item",
+            Self::Go => matches!(kind, "function_declaration" | "method_declaration"),
+            _ => false,
+        }
+    }
+
+    // forgeguard: allow FG-CPLX-001 -- flat dispatch table over the parser matrix, one arm per extension
+    pub(crate) fn from_path(path: &Path) -> Option<Self> {
+        match path.extension()?.to_str()? {
+            "js" | "jsx" | "mjs" | "cjs" => Some(Self::JavaScript),
+            "ts" | "mts" | "cts" => Some(Self::TypeScript),
+            "tsx" => Some(Self::Tsx),
+            "rs" => Some(Self::Rust),
+            "go" => Some(Self::Go),
+            "py" | "pyi" => Some(Self::Python),
+            "java" => Some(Self::Java),
+            "kt" | "kts" => Some(Self::Kotlin),
+            "cs" => Some(Self::CSharp),
+            "c" => Some(Self::C),
+            "cpp" | "cc" | "cxx" | "h" | "hpp" => Some(Self::Cpp),
+            "rb" => Some(Self::Ruby),
+            "php" => Some(Self::Php),
+            "swift" => Some(Self::Swift),
+            "dart" => Some(Self::Dart),
+            "sh" | "bash" | "zsh" => Some(Self::Bash),
+            "zig" => Some(Self::Zig),
+            "lua" => Some(Self::Lua),
+            "scala" | "sc" => Some(Self::Scala),
+            "sol" => Some(Self::Solidity),
+            "ex" | "exs" => Some(Self::Elixir),
+            "erl" | "hrl" => Some(Self::Erlang),
+            "r" => Some(Self::RLang),
+            "tf" | "hcl" => Some(Self::Hcl),
+            "html" | "htm" => Some(Self::Html),
+            "css" => Some(Self::Css),
+            "json" => Some(Self::Json),
+            "yaml" | "yml" => Some(Self::Yaml),
+            "toml" => Some(Self::Toml),
+            "md" | "markdown" => Some(Self::Markdown),
+            // .mli needs the separate interface grammar, so only implementation files map here
+            "ml" => Some(Self::Ocaml),
+            "hs" => Some(Self::Haskell),
+            "jl" => Some(Self::Julia),
+            "pl" | "pm" => Some(Self::Perl),
+            "groovy" | "gradle" => Some(Self::Groovy),
+            "m" | "mm" => Some(Self::ObjectiveC),
+            "v" | "sv" | "svh" => Some(Self::Verilog),
+            "svelte" => Some(Self::Svelte),
+            "mk" => Some(Self::Make),
+            _ => None,
+        }
+    }
+
+    // forgeguard: allow FG-CPLX-001 -- flat dispatch table over the parser matrix, one arm per grammar
+    pub(crate) fn language(self) -> Language {
+        match self {
+            Self::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
+            Self::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            Self::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
+            Self::Rust => tree_sitter_rust::LANGUAGE.into(),
+            Self::Go => tree_sitter_go::LANGUAGE.into(),
+            Self::Python => tree_sitter_python::LANGUAGE.into(),
+            Self::Java => tree_sitter_java::LANGUAGE.into(),
+            Self::Kotlin => tree_sitter_kotlin_ng::LANGUAGE.into(),
+            Self::CSharp => tree_sitter_c_sharp::LANGUAGE.into(),
+            Self::C => tree_sitter_c::LANGUAGE.into(),
+            Self::Cpp => tree_sitter_cpp::LANGUAGE.into(),
+            Self::Ruby => tree_sitter_ruby::LANGUAGE.into(),
+            Self::Php => tree_sitter_php::LANGUAGE_PHP.into(),
+            Self::Swift => tree_sitter_swift::LANGUAGE.into(),
+            Self::Dart => tree_sitter_dart::LANGUAGE.into(),
+            Self::Bash => tree_sitter_bash::LANGUAGE.into(),
+            Self::Zig => tree_sitter_zig::LANGUAGE.into(),
+            Self::Lua => tree_sitter_lua::LANGUAGE.into(),
+            Self::Scala => tree_sitter_scala::LANGUAGE.into(),
+            Self::Solidity => tree_sitter_solidity::LANGUAGE.into(),
+            Self::Elixir => tree_sitter_elixir::LANGUAGE.into(),
+            Self::Erlang => tree_sitter_erlang::LANGUAGE.into(),
+            Self::RLang => tree_sitter_r::LANGUAGE.into(),
+            Self::Hcl => tree_sitter_hcl::LANGUAGE.into(),
+            Self::Html => tree_sitter_html::LANGUAGE.into(),
+            Self::Css => tree_sitter_css::LANGUAGE.into(),
+            Self::Json => tree_sitter_json::LANGUAGE.into(),
+            Self::Yaml => tree_sitter_yaml::LANGUAGE.into(),
+            Self::Toml => tree_sitter_toml_ng::LANGUAGE.into(),
+            Self::Markdown => tree_sitter_md::LANGUAGE.into(),
+            Self::Ocaml => tree_sitter_ocaml::LANGUAGE_OCAML.into(),
+            Self::Haskell => tree_sitter_haskell::LANGUAGE.into(),
+            Self::Julia => tree_sitter_julia::LANGUAGE.into(),
+            Self::Perl => tree_sitter_perl::LANGUAGE.into(),
+            Self::Groovy => tree_sitter_groovy::LANGUAGE.into(),
+            Self::ObjectiveC => tree_sitter_objc::LANGUAGE.into(),
+            Self::Verilog => tree_sitter_verilog::LANGUAGE.into(),
+            Self::Svelte => tree_sitter_svelte_ng::LANGUAGE.into(),
+            Self::Make => tree_sitter_make::LANGUAGE.into(),
+        }
+    }
+
+    // forgeguard: allow FG-CPLX-001 -- flat dispatch table over the parser matrix, one arm per language
+    fn is_loop(self, kind: &str) -> bool {
+        match self {
+            Self::JavaScript | Self::TypeScript | Self::Tsx => matches!(
+                kind,
+                "for_statement" | "for_in_statement" | "while_statement" | "do_statement"
+            ),
+            Self::Rust => matches!(
+                kind,
+                "for_expression" | "while_expression" | "loop_expression"
+            ),
+            Self::Go => kind == "for_statement",
+            Self::Python => matches!(
+                kind,
+                "for_statement"
+                    | "while_statement"
+                    | "list_comprehension"
+                    | "set_comprehension"
+                    | "dictionary_comprehension"
+                    | "generator_expression"
+            ),
+            Self::Java => matches!(
+                kind,
+                "for_statement" | "enhanced_for_statement" | "while_statement" | "do_statement"
+            ),
+            Self::Kotlin => matches!(
+                kind,
+                "for_statement" | "while_statement" | "do_while_statement"
+            ),
+            Self::CSharp => matches!(
+                kind,
+                "for_statement" | "foreach_statement" | "while_statement" | "do_statement"
+            ),
+            Self::C | Self::Cpp | Self::Dart => {
+                matches!(kind, "for_statement" | "while_statement" | "do_statement")
+            }
+            Self::Ruby => matches!(kind, "for" | "while" | "until"),
+            Self::Php => matches!(
+                kind,
+                "for_statement" | "foreach_statement" | "while_statement" | "do_statement"
+            ),
+            Self::Swift => matches!(
+                kind,
+                "for_statement" | "while_statement" | "repeat_while_statement"
+            ),
+            Self::Bash => matches!(
+                kind,
+                "for_statement" | "c_style_for_statement" | "while_statement" | "until_statement"
+            ),
+            Self::Zig => matches!(kind, "for_statement" | "while_statement"),
+            Self::Lua => matches!(
+                kind,
+                "for_statement"
+                    | "for_numeric_statement"
+                    | "for_generic_statement"
+                    | "while_statement"
+                    | "repeat_statement"
+            ),
+            Self::Scala => matches!(kind, "for_expression" | "while_expression"),
+            Self::Solidity => matches!(
+                kind,
+                "for_statement" | "while_statement" | "do_while_statement"
+            ),
+            Self::RLang => matches!(kind, "for" | "while_statement" | "for_statement" | "while"),
+            // Functional/declarative grammars: no imperative loop nodes.
+            Self::Elixir | Self::Erlang | Self::Hcl => false,
+            // Parser-only languages: no structural rules, so no loop node mapping.
+            Self::Html
+            | Self::Css
+            | Self::Json
+            | Self::Yaml
+            | Self::Toml
+            | Self::Markdown
+            | Self::Ocaml
+            | Self::Haskell
+            | Self::Julia
+            | Self::Perl
+            | Self::Groovy
+            | Self::ObjectiveC
+            | Self::Verilog
+            | Self::Svelte
+            | Self::Make => false,
+        }
+    }
+
+    fn is_linear_lookup(self, method: &str) -> bool {
+        match self {
+            Self::JavaScript | Self::TypeScript | Self::Tsx => {
+                matches!(method, "find" | "includes" | "indexOf")
+            }
+            Self::Rust => matches!(method, "find" | "position"),
+            Self::Python => method == "index",
+            Self::Java => method == "indexOf",
+            Self::Kotlin => matches!(method, "find" | "firstOrNull" | "indexOf"),
+            Self::CSharp => matches!(method, "Find" | "IndexOf"),
+            Self::Ruby => matches!(method, "find" | "index"),
+            Self::Php => matches!(method, "in_array" | "array_search"),
+            Self::Swift => method == "firstIndex",
+            Self::Dart => matches!(method, "firstWhere" | "indexOf"),
+            Self::Go | Self::C | Self::Cpp | Self::Bash => false,
+            Self::Zig
+            | Self::Lua
+            | Self::Scala
+            | Self::Solidity
+            | Self::Elixir
+            | Self::Erlang
+            | Self::RLang
+            | Self::Hcl
+            | Self::Html
+            | Self::Css
+            | Self::Json
+            | Self::Yaml
+            | Self::Toml
+            | Self::Markdown
+            | Self::Ocaml
+            | Self::Haskell
+            | Self::Julia
+            | Self::Perl
+            | Self::Groovy
+            | Self::ObjectiveC
+            | Self::Verilog
+            | Self::Svelte
+            | Self::Make => false,
+        }
+    }
+
+    fn is_iteration_call(self, callee: &str) -> bool {
+        match self {
+            Self::JavaScript | Self::TypeScript | Self::Tsx => {
+                matches!(terminal_name(callee), "map" | "filter" | "forEach")
+            }
+            Self::Rust => terminal_name(callee) == "for_each",
+            Self::Java | Self::Kotlin => {
+                matches!(terminal_name(callee), "map" | "filter" | "forEach")
+            }
+            Self::CSharp => matches!(terminal_name(callee), "Select" | "Where" | "ForEach"),
+            Self::Cpp => terminal_name(callee) == "for_each",
+            Self::Ruby => matches!(terminal_name(callee), "each" | "map" | "select"),
+            Self::Php => matches!(terminal_name(callee), "array_map" | "array_filter"),
+            Self::Swift => matches!(terminal_name(callee), "map" | "filter" | "forEach"),
+            Self::Dart => matches!(terminal_name(callee), "map" | "where" | "forEach"),
+            Self::Go | Self::Python | Self::C | Self::Bash => false,
+            Self::Zig
+            | Self::Lua
+            | Self::Scala
+            | Self::Solidity
+            | Self::Elixir
+            | Self::Erlang
+            | Self::RLang
+            | Self::Hcl
+            | Self::Html
+            | Self::Css
+            | Self::Json
+            | Self::Yaml
+            | Self::Toml
+            | Self::Markdown
+            | Self::Ocaml
+            | Self::Haskell
+            | Self::Julia
+            | Self::Perl
+            | Self::Groovy
+            | Self::ObjectiveC
+            | Self::Verilog
+            | Self::Svelte
+            | Self::Make => false,
+        }
+    }
+
+    /// Array/object/collection literal kinds that commonly hold embedded
+    /// fixture or mock datasets. Scoped to the languages where huge inline data
+    /// dumps actually happen; other languages return false.
+    fn is_data_literal(self, kind: &str) -> bool {
+        match self {
+            Self::JavaScript | Self::TypeScript | Self::Tsx => {
+                matches!(kind, "array" | "object")
+            }
+            Self::Python => matches!(kind, "list" | "dictionary" | "set" | "tuple"),
+            _ => false,
+        }
+    }
+}
+
+pub(crate) struct CanonicalFunction {
+    pub profile: &'static str,
+    pub line: usize,
+    pub end_line: usize,
+    pub canonical: String,
+    pub behavior: Option<String>,
+    pub domain: Vec<String>,
+    pub original: String,
+}
+
+pub(crate) fn canonical_functions(
+    path: &Path,
+    source: &str,
+    minimum_lines: usize,
+) -> Vec<CanonicalFunction> {
+    let Some(profile) = LanguageProfile::from_path(path) else {
+        return Vec::new();
+    };
+    let mut parser = Parser::new();
+    if parser.set_language(&profile.language()).is_err() {
+        return Vec::new();
+    }
+    let Some(tree) = parser
+        .parse(source, None)
+        .filter(|tree| !tree.root_node().has_error())
+    else {
+        return Vec::new();
+    };
+    let mut functions = Vec::new();
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if is_clone_scope(node.kind())
+            && node.end_position().row + 1 >= node.start_position().row + minimum_lines
+        {
+            let mut identifiers = HashMap::new();
+            let mut canonical = String::new();
+            canonicalize_node(node, source, &mut identifiers, &mut canonical);
+            functions.push(CanonicalFunction {
+                profile: profile.family(),
+                line: node.start_position().row + 1,
+                canonical,
+                end_line: node.end_position().row + 1,
+                behavior: behavioral_fingerprint(node, source),
+                domain: node
+                    .child_by_field_name("name")
+                    .map(|name| domain_tokens(node_text(name, source)))
+                    .unwrap_or_default(),
+                original: node_text(node, source)
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            });
+        } else {
+            stack.extend(
+                (0..node.named_child_count()).filter_map(|index| node.named_child(index as u32)),
+            );
+        }
+    }
+    functions
+}
+
+fn domain_tokens(name: &str) -> Vec<String> {
+    let mut words = String::with_capacity(name.len());
+    let mut previous_lowercase = false;
+    for character in name.chars() {
+        if !character.is_ascii_alphanumeric() {
+            words.push(' ');
+            previous_lowercase = false;
+            continue;
+        }
+        if character.is_ascii_uppercase() && previous_lowercase {
+            words.push(' ');
+        }
+        words.push(character.to_ascii_lowercase());
+        previous_lowercase = character.is_ascii_lowercase();
+    }
+    words
+        .split_whitespace()
+        .filter(|word| {
+            word.len() >= 4
+                && !matches!(
+                    *word,
+                    "build"
+                        | "create"
+                        | "delete"
+                        | "export"
+                        | "handle"
+                        | "import"
+                        | "process"
+                        | "update"
+                )
+        })
+        .map(str::to_owned)
+        .collect()
+}
+
+fn behavioral_fingerprint(root: Node<'_>, source: &str) -> Option<String> {
+    let mut calls = Vec::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node != root && is_complexity_scope(node.kind()) {
+            continue;
+        }
+        if let Some(callee) = call_name(node, source) {
+            let terminal = terminal_name(callee).to_ascii_lowercase();
+            if !matches!(terminal.as_str(), "log" | "print" | "println") {
+                calls.push(terminal);
+            }
+        }
+        stack.extend(
+            (0..node.named_child_count()).filter_map(|index| node.named_child(index as u32)),
+        );
+    }
+    calls.sort();
+    calls.dedup();
+    (calls.len() >= 3).then(|| calls.join("|"))
+}
+
+fn is_clone_scope(kind: &str) -> bool {
+    matches!(
+        kind,
+        "function_declaration"
+            | "function_definition"
+            | "function_item"
+            | "method"
+            | "method_declaration"
+            | "method_definition"
+            | "constructor_declaration"
+            | "arrow_function"
+    )
+}
+
+fn is_complexity_scope(kind: &str) -> bool {
+    is_clone_scope(kind)
+        || matches!(
+            kind,
+            "function_expression"
+                | "arrow_function"
+                | "lambda"
+                | "closure_expression"
+                | "anonymous_function"
+                | "local_function_statement"
+        )
+}
+
+fn canonicalize_node(
+    node: Node<'_>,
+    source: &str,
+    identifiers: &mut HashMap<String, usize>,
+    output: &mut String,
+) {
+    if node.kind().contains("comment") {
+        return;
+    }
+    output.push('(');
+    output.push_str(node.kind());
+    if node.child_count() == 0 {
+        output.push(':');
+        let text = node_text(node, source);
+        if is_local_identifier(node) {
+            let next = identifiers.len();
+            let id = *identifiers.entry(text.to_owned()).or_insert(next);
+            output.push('v');
+            output.push_str(&id.to_string());
+        } else {
+            output.push_str(text);
+        }
+    } else {
+        for index in 0..node.child_count() {
+            if let Some(child) = node.child(index as u32) {
+                canonicalize_node(child, source, identifiers, output);
+            }
+        }
+    }
+    output.push(')');
+}
+
+fn is_local_identifier(node: Node<'_>) -> bool {
+    if node.kind() != "identifier" && node.kind() != "simple_identifier" {
+        return false;
+    }
+    let Some(parent) = node.parent() else {
+        return true;
+    };
+    for field in ["field", "function", "method", "name", "property"] {
+        if parent.child_by_field_name(field) == Some(node)
+            && matches!(field, "field" | "function" | "method" | "property")
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// Blank every byte outside `regions` (non-newline → space, newline kept) so
+/// the returned source parses as the embedded language while row and column
+/// positions still map back to the original file.
+fn mask_outside(source: &str, regions: &[(usize, usize)]) -> String {
+    let bytes = source.as_bytes();
+    let mut out: Vec<u8> = bytes
+        .iter()
+        .map(|&byte| if byte == b'\n' { b'\n' } else { b' ' })
+        .collect();
+    for &(start, end) in regions {
+        if let (Some(dst), Some(src)) = (out.get_mut(start..end), bytes.get(start..end)) {
+            dst.copy_from_slice(src);
+        }
+    }
+    String::from_utf8(out).unwrap_or_default()
+}
+
+fn call_name<'a>(node: Node<'a>, source: &'a str) -> Option<&'a str> {
+    let callee = match node.kind() {
+        "call_expression" => node
+            .child_by_field_name("function")
+            .or_else(|| node.named_child(0))?,
+        "call" => {
+            if let Some(function) = node.child_by_field_name("function") {
+                function
+            } else {
+                return qualified_call_name(node, source, "receiver", "method");
+            }
+        }
+        "method_call_expression" => {
+            return qualified_call_name(node, source, "receiver", "method");
+        }
+        "method_invocation" => return qualified_call_name(node, source, "object", "name"),
+        "invocation_expression" | "function_call_expression" => {
+            node.child_by_field_name("function")?
+        }
+        "member_call_expression" | "nullsafe_member_call_expression" => {
+            return qualified_call_name(node, source, "object", "name");
+        }
+        "scoped_call_expression" => {
+            return qualified_call_name(node, source, "scope", "name");
+        }
+        "macro_invocation" => node.child_by_field_name("macro")?,
+        _ => return None,
+    };
+    Some(node_text(callee, source))
+}
+
+fn qualified_call_name<'a>(
+    node: Node<'_>,
+    source: &'a str,
+    receiver_field: &str,
+    method_field: &str,
+) -> Option<&'a str> {
+    let method = node.child_by_field_name(method_field)?;
+    let Some(receiver) = node.child_by_field_name(receiver_field) else {
+        return Some(node_text(method, source));
+    };
+    source.get(receiver.start_byte()..method.end_byte())
+}
+
+fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
+    source.get(node.byte_range()).unwrap_or_default()
+}
+
+fn terminal_name(callee: &str) -> &str {
+    callee
+        .rsplit(['.', ':', '>'])
+        .find(|part| !part.is_empty())
+        .unwrap_or(callee)
+}
+
+fn is_database_call(callee: &str, method: &str) -> bool {
+    let normalized = callee.to_ascii_lowercase();
+    let method = normalized_method(method);
+    let database_receiver = has_receiver(
+        &normalized,
+        &[
+            "db",
+            "database",
+            "repo",
+            "repository",
+            "prisma",
+            "sequelize",
+            "typeorm",
+            "sqlx",
+            "diesel",
+        ],
+    );
+    database_receiver
+        && matches!(
+            method.as_str(),
+            "findmany"
+                | "findunique"
+                | "findfirst"
+                | "query"
+                | "execute"
+                | "fetch"
+                | "fetchall"
+                | "fetchone"
+                | "save"
+                | "create"
+                | "update"
+                | "delete"
+                | "insert"
+                | "insertinto"
+        )
+}
+
+fn is_network_call(callee: &str, method: &str) -> bool {
+    if callee == "fetch" || callee.starts_with("reqwest::") {
+        return true;
+    }
+    let normalized = callee.to_ascii_lowercase();
+    let method = normalized_method(method);
+    let network_receiver = has_receiver(
+        &normalized,
+        &[
+            "axios",
+            "http",
+            "client",
+            "apiclient",
+            "httpclient",
+            "requests",
+            "httpx",
+            "urllib",
+            "session",
+        ],
+    );
+    network_receiver
+        && matches!(
+            method.as_str(),
+            "get" | "post" | "put" | "patch" | "delete" | "request" | "send"
+        )
+}
+
+fn normalized_method(method: &str) -> String {
+    let mut normalized = method.to_ascii_lowercase().replace('_', "");
+    if normalized.ends_with("async") {
+        normalized.truncate(normalized.len() - "async".len());
+    }
+    normalized
+}
+
+fn has_receiver(callee: &str, names: &[&str]) -> bool {
+    callee
+        .split(['.', ':', '-', '>', '$'])
+        .any(|part| names.contains(&part))
+}
+
+fn is_unbounded_parallel(callee: &str, node: Node<'_>, source: &str) -> bool {
+    terminal_name(callee) == "join_all"
+        || (callee == "Promise.all" && has_iteration_descendant(node, source))
+}
+
+fn has_iteration_descendant(node: Node<'_>, source: &str) -> bool {
+    let mut stack = (0..node.named_child_count())
+        .filter_map(|index| node.named_child(index as u32))
+        .collect::<Vec<_>>();
+    while let Some(child) = stack.pop() {
+        if call_name(child, source).is_some_and(|callee| terminal_name(callee) == "map") {
+            return true;
+        }
+        stack.extend(
+            (0..child.named_child_count()).filter_map(|index| child.named_child(index as u32)),
+        );
+    }
+    false
+}
+
+fn has_static_bound(node: Node<'_>, source: &str) -> bool {
+    has_static_take_bound(node, source) || has_literal_range_iterable(node, source)
+}
+
+/// True when a direct child of the loop is `range(<int literals>)`, i.e. the loop
+/// bound is a compile-time constant and cannot grow multiplicatively.
+fn has_literal_range_iterable(node: Node<'_>, source: &str) -> bool {
+    (0..node.named_child_count())
+        .filter_map(|index| node.named_child(index as u32))
+        .any(|child| {
+            call_name(child, source).is_some_and(|callee| terminal_name(callee) == "range")
+                && all_integer_arguments(child)
+        })
+}
+
+fn all_integer_arguments(call: Node<'_>) -> bool {
+    let Some(arguments) = call.child_by_field_name("arguments") else {
+        return false;
+    };
+    let mut count = 0;
+    for index in 0..arguments.named_child_count() {
+        let Some(argument) = arguments.named_child(index as u32) else {
+            continue;
+        };
+        if argument.kind() != "integer" {
+            return false;
+        }
+        count += 1;
+    }
+    count > 0
+}
+
+fn has_static_take_bound(node: Node<'_>, source: &str) -> bool {
+    let text = node_text(node, source);
+    let Some((_, after_take)) = text.split_once(".take(") else {
+        return false;
+    };
+    let Some((argument, _)) = after_take.split_once(')') else {
+        return false;
+    };
+    !argument.is_empty() && argument.chars().all(|character| character.is_ascii_digit())
+}
+
+fn finding_for_node(
+    rule_id: &str,
+    title: &str,
+    severity: Severity,
+    path: &Path,
+    node: Node<'_>,
+    source: &str,
+    recommendation: &str,
+) -> Finding {
+    finding(
+        rule_id,
+        title,
+        severity,
+        path,
+        node.start_position().row + 1,
+        node_text(node, source),
+        recommendation,
+    )
+}
+
+fn parse_finding(path: &Path, evidence: &str) -> Finding {
+    finding(
+        "FG-PARSE-001",
+        "Structural analysis skipped",
+        Severity::Info,
+        path,
+        1,
+        evidence,
+        "Fix syntax errors or use a supported parser before relying on structural findings.",
+    )
+}
+
+fn finding(
+    rule_id: &str,
+    title: &str,
+    severity: Severity,
+    path: &Path,
+    line: usize,
+    evidence: &str,
+    recommendation: &str,
+) -> Finding {
+    Finding {
+        rule_id: rule_id.to_owned(),
+        title: title.to_owned(),
+        severity,
+        confidence: rules::metadata(rule_id)
+            .map(|rule| rule.confidence)
+            .unwrap_or(EvidenceConfidence::Heuristic),
+        blocking: false,
+        path: path.to_path_buf(),
+        line,
+        end_line: None,
+        evidence: truncate(evidence, 240),
+        recommendation: recommendation.to_owned(),
+    }
+}
+
+fn truncate(value: &str, max_chars: usize) -> String {
+    let mut output: String = value.chars().take(max_chars).collect();
+    if value.chars().count() > max_chars {
+        output.push('…');
+    }
+    output
+}
